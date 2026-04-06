@@ -1,0 +1,14 @@
+{
+  "layers": [
+    {"index": 1, "name": "phenotype"},
+    {"index": 2, "name": "anatomy"},
+    {"index": 3, "name": "disease"},
+    {"index": 4, "name": "drug"}
+  ],
+  "relations": [
+    {"from": "phenotype", "to": "anatomy", "type": "LOCATED_IN"},
+    {"from": "anatomy", "to": "disease", "type": "AFFECTS"},
+    {"from": "disease", "to": "drug", "type": "CURED_BY"}
+  ],
+  "root_layer": "disease"
+}

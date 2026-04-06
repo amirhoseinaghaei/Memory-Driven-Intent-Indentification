@@ -1,0 +1,17 @@
+pot
+openai
+tqdm
+torch 
+neo4j
+pandas
+rapidfuzz
+pyvis
+pydantic_settings
+requests
+langchain_core
+matplotlib
+sentence_transformers 
+langchain_openai 
+langgraph
+hdbscan
+networkx

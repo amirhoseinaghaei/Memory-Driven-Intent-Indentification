@@ -1,0 +1,17 @@
+# Ignore folders anywhere
+**/result/
+**/result2/
+**/lib/
+
+# Ignore all CSV files
+*.csv
+*.xlsx
+*.log
+archive/
+.venv2/
+hipporag_index/
+/home/amiraghaei/memory-driven-intention-identification-agent/src/config/config.json
+**/config.json
+raw_data/
+graphs/
+test_data/
