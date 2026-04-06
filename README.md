@@ -152,20 +152,43 @@ The agent returns:
 
 ## 🛠️ Architecture Overview
 
+This project is designed so a user can describe symptoms naturally and receive a medical-style response backed by graph retrieval and embeddings.
+
+1. **User input**: A person enters symptoms, context, or a health concern.
+2. **Agent receives the query**: The LangGraph-based medical agent parses the input, understands intent, and decides whether it has enough information.
+3. **Retrieval layer**: The agent uses semantic embeddings and phenotype clusters to search the Neo4j graph for related diseases, symptoms, genes, and drugs.
+4. **Clarification loop**: If the initial query is ambiguous, the agent asks follow-up questions to narrow the diagnosis.
+5. **Response generation**: The agent ranks candidate diseases and returns the top matches, confidence scores, and any requested clarifications.
+
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   User Query    │───▶│   LangGraph      │───▶│   Neo4j Graph   │
-│                 │    │   Agent          │    │   Database      │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                                │
-                                ▼
-                       ┌──────────────────┐
-                       │   Retrieval      │
-                       │   Engine         │
-                       │   (Embeddings +  │
-                       │    Clustering)   │
-                       └──────────────────┘
+User Input
+   │
+   ▼
+Medical Agent (LangGraph)
+   │
+   ├─> Query Parser + Intent Understanding
+   │
+   ├─> Retrieval Engine
+   │      ├─ Embeddings Search
+   │      └─ Phenotype Clustering
+   │
+   └─> Response Formatter
+          ├─ Top disease candidates
+          ├─ Confidence scores
+          └─ Follow-up questions
+   │
+   ▼
+Neo4j Graph Database
+   └─> Disease, Symptom, Gene, Drug relationships
 ```
+
+### User interaction flow
+
+- The user starts by typing symptoms or a health concern.
+- The agent analyzes the text and performs a semantic search over the medical graph.
+- If needed, the agent asks the user one or more clarifying questions.
+- The user answers, and the agent refines its candidate ranking.
+- The agent then returns the best disease candidates, with supporting information and confidence levels.
 
 ## 🤝 Contributing
 
