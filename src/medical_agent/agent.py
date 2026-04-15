@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Set, TypedDict, Tuple
 
 from langgraph.graph import StateGraph, END
 from src.medical_agent.tools import make_retrieve_tool
-from src.retrieval.retriever import Retriever
+from src.retrieval.retriever2 import Retriever
 from src.config.config import settings
 from src.gen_ai_gateway.chat_completion import ChatCompletion
 
@@ -630,5 +630,5 @@ if __name__ == "__main__":
 
     agent = build_graph_agent(retriever)
     first_query = "My child has been peeing a lot and seems smaller than other kids the same age. Could polyuria from the kidney be related to short stature?"
-    run_interactive(agent, first_query=first_query, max_rounds=5, target_disease_id="disease:8661")
+    run_interactive(agent, first_query=first_query, max_rounds=5, target_disease_id="disease:10204")
 

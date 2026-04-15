@@ -39,6 +39,21 @@ def weighted_node_coverage(A_ref, complete_node_ids, partial_node_ids):
     return numer / denom if denom > 1e-12 else 0.0
 
 
+
+def raw_node_coverage(complete_node_ids, partial_node_ids):
+    """
+    Fraction of complete-graph nodes present in the partial graph
+    (no weighting, pure set overlap).
+    """
+    complete_set = set(complete_node_ids)
+    partial_set = set(partial_node_ids)
+
+    if len(complete_set) == 0:
+        return 0.0
+
+    intersection = complete_set & partial_set
+    return len(intersection) / len(complete_set)
+
 def blended_containment_score(
     A_ref,
     A_tgt,
@@ -52,7 +67,8 @@ def blended_containment_score(
     Kept minimal for current usage.
     Only node coverage is used by flgw_partial_coverage.
     """
-    node_cov = weighted_node_coverage(A_ref, complete_node_ids, partial_node_ids)
+    # node_cov = weighted_node_coverage(A_ref, complete_node_ids, partial_node_ids)
+    node_cov = raw_node_coverage(complete_node_ids, partial_node_ids)
     containment = w_node * node_cov
     return containment, node_cov, 0.0, 0.0
 

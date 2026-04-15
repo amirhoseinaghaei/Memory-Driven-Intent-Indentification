@@ -173,7 +173,7 @@ def save_graph_html(g: nx.DiGraph, title: str, out_path: str) -> None:
     net.write_html(out_path)
 
 
-def save_partial_and_complete(result: dict, out_dir: str = "graphs_test") -> None:
+def save_partial_and_complete(result: dict, out_dir: str = "graphs_test2") -> None:
     """
     result format:
     {
