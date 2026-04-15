@@ -89,7 +89,7 @@ def _build_ner_messages(query: str, ranked: list) -> list:
                 "- Use meaning-based matching, not exact keywords.\n\n"
                 "Hard rules:\n"
                 "1) Choose ONLY from the Symptom List (never invent symptoms).\n"
-                "2) Return minimum 3 and AT MOST 15 symptoms total.\n"
+                "2) Return minimum 2 and AT MOST 15 symptoms total.\n"
                 "3) For each symptom, list EXACTLY 3 organs from organ list "
                 "that are implicated by that symptom.\n"
                 f"Symptom List (flat list):\n{ranked}\n\n"

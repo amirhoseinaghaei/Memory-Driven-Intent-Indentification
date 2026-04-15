@@ -158,7 +158,7 @@ def evaluate_3round_excel(
         df = df.iloc[start_row:].reset_index(drop=True)
     df =df[:308]
     # print(df["rank_r1"])
-    df = df[df["rank_r1"].astype(str).str.strip().isin(["4.0", "5.0", "6.0"])]    
+    # df = df[df["rank_r1"].astype(str).str.strip().isin(["4.0", "5.0", "6.0"])]    
     # print(len(df))
     rows_out: List[Dict[str, Any]] = []
 

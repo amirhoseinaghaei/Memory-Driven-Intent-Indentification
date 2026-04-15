@@ -6,7 +6,7 @@ from typing import Any, Dict
 from src.db_managers.neo4j_graph_client import Neo4jGraphClient
 from src.data_models.neo4j_conf import Neo4jConfig
 from src.data_models.graph_schema import GraphSchema
-from src.pipeline.mapper import Mapper 
+from src.indexing_pipeline.mapper import Mapper 
 
 
 class GraphIngestor:

@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
+
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------------------------------------------------------
@@ -277,31 +281,106 @@ def normalize_extraction_output(payload: dict, schema: SchemaSpec, fallback_root
     }
 
 
-# -----------------------------------------------------------------------------
-# Extractor
-# -----------------------------------------------------------------------------
+# ============================================================================
+# OPTIMIZED EXTRACTOR WITH ASYNC & BATCH SUPPORT
+# ============================================================================
+
 class SchemaDrivenExtractor:
+    """Optimized extractor with async support, connection pooling, and caching."""
+    
     def __init__(
         self,
         api_key: str,
         model: str = "gpt-5.2",
         base_url: str = "https://api.forge.tensorblock.co/v1",
+        max_parallel: int = 5,
+        timeout: int = 60,
     ) -> None:
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.api_key = api_key
         self.model = model
+        self.base_url = base_url
+        self.max_parallel = max_parallel
+        self.timeout = timeout
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._system_prompt_cache: Dict[str, str] = {}
+
+    def _get_system_prompt(self, schema: SchemaSpec) -> str:
+        """Cache system prompt to avoid rebuilding."""
+        schema_key = f"{schema.root_layer}_{len(schema.layers)}_{len(schema.relations)}"
+        if schema_key not in self._system_prompt_cache:
+            layers_desc = [{"index": layer.index, "name": layer.name} for layer in schema.layers]
+            relations_desc = [
+                {"from": rel.from_layer, "to": rel.to_layer, "type": rel.rel_type}
+                for rel in schema.relations
+            ]
+            example_output = {
+                "document_root": {
+                    "layer": schema.root_layer,
+                    "id": "<root_id>",
+                    "name": "<root_name>"
+                },
+                "entities_by_layer": {
+                    layer.name: [{"id": f"<{layer.name}_id>", "name": f"<{layer.name}_name>"}]
+                    for layer in schema.layers
+                },
+                "relations": [
+                    {
+                        "from_layer": rel.from_layer,
+                        "from_id": "<source_id>",
+                        "to_layer": rel.to_layer,
+                        "to_id": "<target_id>",
+                        "type": rel.rel_type
+                    }
+                    for rel in schema.relations
+                ]
+            }
+            self._system_prompt_cache[schema_key] = f"""You are a schema-driven information extraction system.
+Extract entities and relations from the document according to the schema below.
+
+Schema layers:
+{json.dumps(layers_desc, ensure_ascii=False, indent=2)}
+
+Schema relations:
+{json.dumps(relations_desc, ensure_ascii=False, indent=2)}
+
+Root layer: "{schema.root_layer}"
+
+Return STRICT JSON ONLY in exactly this structure:
+{json.dumps(example_output, ensure_ascii=False, indent=2)}
+
+Rules:
+1. Extract only facts supported by the text.
+2. Use only the given layers and relation types.
+3. Every entity must appear under the correct layer in entities_by_layer.
+4. Relations must only connect valid schema layer pairs.
+5. Preserve ids from the text if they exist.
+6. If no explicit id exists, generate a lowercase snake_case id.
+7. Remove duplicates.
+8. If a layer has no entities, return an empty list.
+9. If the root is not explicit, infer the most likely root from the text or filename.
+10. Return JSON only. No markdown. No explanation."""
+        return self._system_prompt_cache[schema_key]
 
     def extract_file(self, schema: SchemaSpec, txt_path: Path) -> dict:
+        """Synchronous extraction (original interface)."""
         text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
         if not text:
             raise ValueError(f"File is empty: {txt_path.name}")
 
+        # Use original build_extraction_messages for compatibility
         messages = build_extraction_messages(schema, txt_path.name, text)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0,
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0,
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            logger.error(f"API call failed for {txt_path.name}: {e}")
+            raise
 
         raw = (response.choices[0].message.content or "").strip()
         parsed = safe_json_loads(raw)
@@ -310,4 +389,53 @@ class SchemaDrivenExtractor:
             payload=parsed,
             schema=schema,
             fallback_root_name=txt_path.stem,
-        ) 
+        )
+
+    async def extract_file_async(self, schema: SchemaSpec, txt_path: Path) -> dict:
+        """Async extraction for parallel processing."""
+        text = txt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if not text:
+            raise ValueError(f"File is empty: {txt_path.name}")
+
+        # Use original build_extraction_messages for compatibility
+        messages = build_extraction_messages(schema, txt_path.name, text)
+
+        try:
+            response = await self.async_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0,
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            logger.error(f"Async API call failed for {txt_path.name}: {e}")
+            raise
+
+        raw = (response.choices[0].message.content or "").strip()
+        parsed = safe_json_loads(raw)
+
+        return normalize_extraction_output(
+            payload=parsed,
+            schema=schema,
+            fallback_root_name=txt_path.stem,
+        )
+
+    async def extract_files_parallel(self, schema: SchemaSpec, txt_paths: List[Path]) -> List[dict]:
+        """Extract multiple files in parallel with concurrency control."""
+        semaphore = asyncio.Semaphore(self.max_parallel)
+
+        async def bounded_extract(path: Path):
+            async with semaphore:
+                return await self.extract_file_async(schema, path)
+
+        tasks = [bounded_extract(path) for path in txt_paths]
+        return await asyncio.gather(*tasks, return_exceptions=False)
+
+    def extract_files_parallel_sync(self, schema: SchemaSpec, txt_paths: List[Path]) -> List[dict]:
+        """Synchronous wrapper for parallel extraction."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(self.extract_files_parallel(schema, txt_paths))
+        finally:
+            loop.close() 
