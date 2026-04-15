@@ -1,28 +1,19 @@
 from __future__ import annotations
-
-import ast
 import json
 import logging
-import math
 import time
 from pathlib import Path
-from math import e, log
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Literal
+from typing import Any, Dict, List, Optional, Set, Tuple, Literal
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from concurrent.futures import ThreadPoolExecutor
 import hdbscan
 import numpy as np
 import umap
 from neo4j import GraphDatabase, Driver
 from sklearn.preprocessing import normalize
-
-from src.config.config import settings
 from src.data_models.neo4j_conf import Neo4jConfig
 from src.gen_ai_gateway.embedder import Embed
-from src.gen_ai_gateway.chat_completion import ChatCompletion
-from src.graph_comparison.weighted_coverage import weighted_coverage
-from src.graph_comparison.new_linear_gw import pflgw_directed_distance
+from src.graph_comparison.fpgw_dis import pflgw_directed_distance
 from src.utils.helpers import (
     safe_parse_llm_json,
     _strip_embeddings,
@@ -892,7 +883,7 @@ class Retriever:
         previous_diseases: list,
         sim_threshold_ph: float = 0.8,
         sim_threshold_an: float = 0.8,
-        top_k_ph: int = 1,
+        top_k_ph: int = 2,
         top_k_an_per_ph: int = 1,
         phenotype_mode="ANY",
         include_parent_of: bool = False,
@@ -1012,8 +1003,6 @@ class Retriever:
             if not groups:
                 return _EMPTY
 
-            # current_ph = [g["ph_id"] for g in groups]
-            current_an = list({a for g in groups for a in g["an_ids"]})
             current_ph = [g["ph_id"] for g in groups]
             all_groups = previous_groups + groups
 
@@ -1027,7 +1016,6 @@ class Retriever:
 
             _set_ph = set(current_ph)
             if not previous_groups:
-                print("sssssssssssssssssssssssssaaaaaa")
                 ph_required = 1
             else:
                 ph_required = min(2, len(_set_ph))
@@ -1039,10 +1027,6 @@ class Retriever:
                     for p in complete_pairs
                     if p.get("ph") and p["ph"].get("id")
                 }
-
-                print("complete phenotypes:", len(cg_ph), "query phenotypes:", len(_set_ph))
-                print("overlap:", len(cg_ph & _set_ph))
-
                 if len(cg_ph & _set_ph) >= ph_required:
                     item = {
                         "disease": sg.get("disease") or {},
