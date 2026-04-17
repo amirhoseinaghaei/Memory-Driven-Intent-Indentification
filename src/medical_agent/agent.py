@@ -1,58 +1,91 @@
+"""
+Medical Diagnosis Agent Module
+
+A sophisticated conversational AI agent for medical diagnosis that leverages graph-based
+retrieval and iterative symptom clarification to identify potential diseases from patient
+descriptions.
+
+The agent employs a multi-step reasoning pipeline:
+1. Receives user symptom descriptions
+2. Retrieves candidate diseases from the knowledge graph
+3. Clarifies symptoms if needed via targeted questions
+4. Returns ranked disease candidates based on symptom matching
+
+Author: Medical AI Team
+Version: 1.0.0
+"""
+
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, Set, TypedDict, Tuple
 
+import numpy as np
 from langgraph.graph import StateGraph, END
+
 from src.medical_agent.tools import make_retrieve_tool
 from src.retrieval.retriever2 import Retriever
 from src.config.config import settings
 from src.gen_ai_gateway.chat_completion import ChatCompletion
+from src.graph_comparison.fpgw_dis import compute_node_importance
 
-# ============================================================
-# Logging / Tracing suppression
-# ============================================================
 
-os.environ["LANGCHAIN_TRACING_V2"] = "false"
-os.environ["LANGCHAIN_DEBUG"] = "false"
+# ============================================================================
+# LOGGER CONFIGURATION
+# ============================================================================
 
-LOGGERS_TO_SUPPRESS = [
-    "langchain",
-    "langchain_core",
-    "langgraph",
-    "neo4j",
-    "neo4j.io",
-    "neo4j.pool",
-    "urllib3",
-    "urllib3.connectionpool",
-]
+def _configure_logging() -> None:
+    """Suppress verbose logging from dependencies to reduce noise."""
+    os.environ["LANGCHAIN_TRACING_V2"] = "false"
+    os.environ["LANGCHAIN_DEBUG"] = "false"
 
-for logger_name in LOGGERS_TO_SUPPRESS:
-    logging.getLogger(logger_name).setLevel(logging.WARNING)
+    # Suppress verbose loggers
+    verbose_loggers = [
+        "langchain", "langchain_core", "langgraph",
+        "neo4j", "neo4j.io", "neo4j.pool",
+        "urllib3", "urllib3.connectionpool",
+    ]
+    for logger_name in verbose_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    logging.basicConfig(level=logging.WARNING)
 
-logging.basicConfig(level=logging.WARNING)
 
-# ============================================================
-# Config
-# ============================================================
+_configure_logging()
 
-THRESHOLD = 0.99  # (kept for fallback when target is not provided)
+
+# ============================================================================
+# CONFIGURATION CONSTANTS
+# ============================================================================
+
+CONFIDENCE_THRESHOLD = 0.99
+"""Minimum score to consider a diagnosis confident without clarification."""
+
 TOPK_FOR_CLARIFY = 3
+"""Number of top candidates to consider for clarification questions."""
+
 MAX_SYMPTOMS_IN_QUESTION = 60
+"""Maximum symptoms to include in a clarification question."""
+
 MAX_DISEASES_IN_ANSWER = 40
+"""Maximum diseases to include in the final answer."""
 
-SYMPTOM_MAPPING_PATH = (
-    "dataset/phenotype_catalog.json"
-)
+SYMPTOM_MAPPING_PATH = "dataset/phenotype_catalog.json"
+"""Path to symptom-to-phenotype-ID mapping file."""
 
-DEBUG = False  # Set to True to see extraction details
+DEBUG = False
+"""Set to True to print detailed extraction and routing information."""
 
-# ============================================================
-# State schema
-# ============================================================
+
+# ============================================================================
+# TYPE DEFINITIONS
+# ============================================================================
 
 class AgentState(TypedDict, total=False):
+    """State schema for the medical diagnosis agent.
+    
+    Maintains conversation context and retrieval state across multiple rounds.
+    """
     user_query: str
     results: Optional[List[Dict[str, Any]]]
     final: Optional[str]
@@ -70,24 +103,30 @@ class AgentState(TypedDict, total=False):
     retrieval_time: Optional[float]
     target_disease_id: Optional[str]
 
-# ============================================================
-# Utilities
-# ============================================================
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Safely convert value to float with fallback."""
     try:
-        return float(x)
-    except Exception:
+        return float(value)
+    except (TypeError, ValueError):
         return default
 
-def _normalize_key(s: str) -> str:
-    return " ".join((s or "").strip().split()).lower()
+
+def _normalize_key(text: str) -> str:
+    """Normalize text for comparison: lowercase, strip, collapse whitespace."""
+    return " ".join((text or "").strip().split()).lower()
+
 
 def load_symptom_mapping(path: str) -> Dict[str, str]:
-    """
-    Supports JSON formats:
-      A) {"Nausea": "phenotype:123", ...}
-      B) [{"name":"Nausea","value":"phenotype:123"}, ...]
+    """Load symptom-to-phenotype mapping from JSON file.
+    
+    Supports two formats:
+    - Dict: {"Symptom Name": "phenotype:123", ...}
+    - List: [{"name": "Symptom Name", "value": "phenotype:123"}, ...]
     """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -96,464 +135,519 @@ def load_symptom_mapping(path: str) -> Dict[str, str]:
         return {str(k).strip(): str(v).strip() for k, v in data.items()}
 
     if isinstance(data, list):
-        out: Dict[str, str] = {}
+        result: Dict[str, str] = {}
         for item in data:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "")).strip()
-            val = str(item.get("value", "")).strip()
-            if name and val:
-                out[name] = val
-        return out
+            value = str(item.get("value", "")).strip()
+            if name and value:
+                result[name] = value
+        return result
 
-    raise ValueError("Unsupported mapping JSON format (must be dict or list[dict]).")
+    raise ValueError("Unsupported symptom mapping format")
+
 
 def build_mapping_state(mapping_path: str) -> Dict[str, Any]:
-    """
-    Load mapping ONCE and return the state fragment to merge into AgentState.
-    """
+    """Build initial state with symptom mappings and normalized indices."""
     name_to_value = load_symptom_mapping(mapping_path)
     norm_index = {_normalize_key(k): v for k, v in name_to_value.items()}
-
     return {
         "symptom_name_to_value": name_to_value,
         "_symptom_norm_index": norm_index,
     }
+
 
 def map_symptom_to_value(
     symptom_name: str,
     name_to_value: Dict[str, str],
     norm_index: Dict[str, str],
 ) -> Optional[str]:
-    """
-    Map symptom display name -> mapped value (phenotype id).
-    """
+    """Map symptom name to phenotype ID with exact and normalized matching."""
     if not symptom_name:
         return None
-
     if symptom_name in name_to_value:
         return name_to_value[symptom_name]
-
     return norm_index.get(_normalize_key(symptom_name))
 
+
 def split_symptom_phrases(text: str) -> List[str]:
-    """
-    Heuristic splitter for user symptom text.
-    Splits by comma, ';', newline, and 'and' / '&'.
-    """
+    """Split user text into symptom phrases by comma, semicolon, newline, 'and', '&'."""
     if not text:
         return []
     parts = re.split(r",|;|\n|\band\b|\b&\b", text, flags=re.IGNORECASE)
-    out: List[str] = []
-    for p in parts:
-        p = " ".join(p.strip().split())
-        if p:
-            out.append(p)
-    return out
+    result: List[str] = []
+    for part in parts:
+        cleaned = " ".join(part.strip().split())
+        if cleaned:
+            result.append(cleaned)
+    return result
+
 
 def extract_user_symptom_values_from_text(
     text: str,
     name_to_value: Dict[str, str],
     norm_index: Dict[str, str],
 ) -> Tuple[Set[str], Set[str]]:
-    """
-    Returns:
-      - user_values: phenotype IDs we can map from the user's text
-      - user_norm_names: normalized symptom phrases (fallback filtering)
-    """
+    """Extract phenotype IDs from user text."""
     user_values: Set[str] = set()
     user_norm_names: Set[str] = set()
 
     for phrase in split_symptom_phrases(text):
-        n = _normalize_key(phrase)
-        user_norm_names.add(n)
-
-        v = map_symptom_to_value(phrase, name_to_value, norm_index)
-        if v:
-            user_values.add(v)
+        normalized = _normalize_key(phrase)
+        user_norm_names.add(normalized)
+        if symptom_id := map_symptom_to_value(phrase, name_to_value, norm_index):
+            user_values.add(symptom_id)
 
     return user_values, user_norm_names
+
 
 def extract_symptom_display_names(
     user_response: str,
     name_to_value: Dict[str, str],
     norm_index: Dict[str, str],
 ) -> List[str]:
-    """
-    Extract symptom display names from user's response.
-
-    Input: "yes, I have cough and nausea"
-    Output: ["Cough", "Nausea"]  (matching the original mapping names)
-
-    Used to add extracted symptoms to user_query.
-    """
+    """Extract canonical symptom display names from user's response."""
     extracted_names: List[str] = []
     seen: Set[str] = set()
 
-    phrases = split_symptom_phrases(user_response)
-
-    for phrase in phrases:
-        pheno_id = map_symptom_to_value(phrase, name_to_value, norm_index)
-
-        if pheno_id:
-            # Find canonical display name(s) corresponding to this pheno id
-            for orig_name, val in name_to_value.items():
-                if val == pheno_id and orig_name not in seen:
-                    extracted_names.append(orig_name)
-                    seen.add(orig_name)
+    for phrase in split_symptom_phrases(user_response):
+        phenotype_id = map_symptom_to_value(phrase, name_to_value, norm_index)
+        if phenotype_id:
+            for original_name, value in name_to_value.items():
+                if value == phenotype_id and original_name not in seen:
+                    extracted_names.append(original_name)
+                    seen.add(original_name)
                     break
         else:
-            norm_phrase = _normalize_key(phrase)
-            if norm_phrase and norm_phrase not in seen:
+            normalized = _normalize_key(phrase)
+            if normalized and normalized not in seen:
                 extracted_names.append(phrase)
-                seen.add(norm_phrase)
+                seen.add(normalized)
 
     return extracted_names
 
-def extract_phenotype_names(complete_g: Any, max_items: int = 12) -> List[str]:
-    """
-    Extract phenotype names from a NetworkX graph, robust to different node schemas.
-    """
-    out: List[str] = []
+
+def extract_phenotype_names(graph: Any, max_items: int = 12) -> List[str]:
+    """Extract phenotype names from NetworkX graph with robust schema handling."""
+    results: List[str] = []
     seen: Set[str] = set()
 
-    def _add(val: Any) -> None:
-        if val is None:
+    def _add(value: Any) -> None:
+        if value is None:
             return
-        s = str(val).strip()
+        s = str(value).strip()
         if not s or s in seen:
             return
         seen.add(s)
-        out.append(s)
+        results.append(s)
 
-    if complete_g is None:
-        return out
-
-    if not (hasattr(complete_g, "nodes") and callable(getattr(complete_g, "nodes", None))):
-        return out
+    if graph is None or not (hasattr(graph, "nodes") and callable(getattr(graph, "nodes", None))):
+        return results
 
     try:
-        for n, attrs in complete_g.nodes(data=True):
-            if len(out) >= max_items:
+        for node_id, attrs in graph.nodes(data=True):
+            if len(results) >= max_items:
                 break
-
             attrs = attrs if isinstance(attrs, dict) else {}
-            node_key = str(n) if n is not None else ""
-            node_id = str(attrs.get("id") or attrs.get("node_id") or node_key)
+            node_key = str(node_id) if node_id is not None else ""
+            node_id_str = str(attrs.get("id") or attrs.get("node_id") or node_key)
 
             label = attrs.get("label") or attrs.get("type") or attrs.get("entity_label") or attrs.get("kind")
             layer = attrs.get("layer")
 
-            is_ph = False
-            if label == "phenotype":
-                is_ph = True
-            elif isinstance(layer, (int, float)) and int(layer) == 1:
-                is_ph = True
-            elif node_key.startswith("phenotype:") or node_id.startswith("phenotype:"):
-                is_ph = True
+            is_phenotype = (
+                label == "phenotype"
+                or (isinstance(layer, (int, float)) and int(layer) == 1)
+                or node_key.startswith("phenotype:")
+                or node_id_str.startswith("phenotype:")
+            )
 
-            if not is_ph:
+            if not is_phenotype:
                 continue
 
             name = (
-                attrs.get("data")
-                or attrs.get("name")
-                or attrs.get("title")
-                or attrs.get("text")
-                or attrs.get("display")
+                attrs.get("data") or attrs.get("name") or attrs.get("title") 
+                or attrs.get("text") or attrs.get("display")
             )
-            _add(name or node_id or node_key)
-
+            _add(name or node_id_str or node_key)
     except Exception:
         pass
 
-    return out
+    return results
+
 
 def extract_phenotype_values_from_graph(
-    g: Any,
+    graph: Any,
     name_to_value: Dict[str, str],
     norm_index: Dict[str, str],
 ) -> Set[str]:
-    """
-    Return phenotype IDs (phenotype:xxxx) found in a NetworkX graph.
+    """Extract phenotype IDs from graph nodes and mapped names."""
+    result: Set[str] = set()
 
-    Works for:
-      - node id like 'phenotype:123'
-      - node attrs with label/kind/layer and a name in attrs['data']/['name'] that can be mapped
-    """
-    out: Set[str] = set()
-    if g is None:
-        return out
-    if not (hasattr(g, "nodes") and callable(getattr(g, "nodes", None))):
-        return out
+    if graph is None or not (hasattr(graph, "nodes") and callable(getattr(graph, "nodes", None))):
+        return result
 
     try:
-        for n, attrs in g.nodes(data=True):
+        for node_id, attrs in graph.nodes(data=True):
             attrs = attrs if isinstance(attrs, dict) else {}
-            node_key = str(n) if n is not None else ""
-            node_id = str(attrs.get("id") or attrs.get("node_id") or node_key)
+            node_key = str(node_id) if node_id is not None else ""
+            node_id_str = str(attrs.get("id") or attrs.get("node_id") or node_key)
 
             label = attrs.get("label") or attrs.get("type") or attrs.get("entity_label") or attrs.get("kind")
             layer = attrs.get("layer")
 
-            is_ph = False
-            if label == "phenotype":
-                is_ph = True
-            elif isinstance(layer, (int, float)) and int(layer) == 1:
-                is_ph = True
-            elif node_key.startswith("phenotype:") or node_id.startswith("phenotype:"):
-                is_ph = True
-
-            if not is_ph:
-                continue
-
-            if node_id.startswith("phenotype:"):
-                out.add(node_id)
-                continue
-
-            name = (
-                attrs.get("data")
-                or attrs.get("name")
-                or attrs.get("title")
-                or attrs.get("text")
-                or attrs.get("display")
+            is_phenotype = (
+                label == "phenotype"
+                or (isinstance(layer, (int, float)) and int(layer) == 1)
+                or node_key.startswith("phenotype:")
+                or node_id_str.startswith("phenotype:")
             )
-            if name:
-                v = map_symptom_to_value(str(name), name_to_value, norm_index)
-                if v:
-                    out.add(v)
+
+            if not is_phenotype:
+                continue
+
+            if node_id_str.startswith("phenotype:"):
+                result.add(node_id_str)
+            else:
+                name = (
+                    attrs.get("data") or attrs.get("name") or attrs.get("title") 
+                    or attrs.get("text") or attrs.get("display")
+                )
+                if name and (phenotype_id := map_symptom_to_value(str(name), name_to_value, norm_index)):
+                    result.add(phenotype_id)
     except Exception:
         pass
 
-    return out
+    return result
 
-# ============================================================
-# Agent
-# ============================================================
 
-def build_graph_agent(gdb: Retriever) -> StateGraph[AgentState]:
-    retrieve_tool = make_retrieve_tool(gdb)
+def extract_top_importance_symptoms(
+    graph: Any,
+    top_k: int = 5,
+) -> List[Tuple[str, str, float]]:
+    """Extract symptoms with highest node importance from graph.
+    
+    Args:
+        graph: NetworkX graph with edges and node attributes
+        top_k: Number of top symptoms to return
+    
+    Returns:
+        List of tuples: (node_id, display_name, importance_score)
+    """
+    if graph is None or not (hasattr(graph, "nodes") and callable(getattr(graph, "nodes", None))):
+        return []
+    
+    try:
+        # Build adjacency matrix from graph
+        node_list = list(graph.nodes())
+        if not node_list:
+            return []
+        
+        node_index = {node_id: idx for idx, node_id in enumerate(node_list)}
+        n = len(node_list)
+        A = np.zeros((n, n), dtype=np.float64)
+        
+        # Populate adjacency matrix from edges
+        for src, tgt, data in graph.edges(data=True):
+            if src in node_index and tgt in node_index:
+                # Use edge weight if available, otherwise 1.0
+                weight = 1.0
+                if isinstance(data, dict):
+                    weight = _safe_float(data.get("weight", 1.0))
+                A[node_index[src], node_index[tgt]] = weight
+        
+        # Compute importance scores
+        importance_scores = compute_node_importance(A)
+        
+        # Collect phenotype nodes with their importance
+        phenotypes_with_importance: List[Tuple[str, str, float]] = []
+        
+        for idx, node_id in enumerate(node_list):
+            attrs = graph.nodes[node_id] if hasattr(graph, "nodes") else {}
+            attrs = attrs if isinstance(attrs, dict) else {}
+            
+            label = attrs.get("label") or attrs.get("type") or attrs.get("entity_label") or attrs.get("kind")
+            layer = attrs.get("layer")
+            node_key = str(node_id)
+            
+            is_phenotype = (
+                label == "phenotype"
+                or (isinstance(layer, (int, float)) and int(layer) == 1)
+                or node_key.startswith("phenotype:")
+            )
+            
+            if not is_phenotype:
+                continue
+            
+            display_name = (
+                attrs.get("data") or attrs.get("name") or attrs.get("title")
+                or attrs.get("text") or attrs.get("display") or node_key
+            )
+            
+            importance = _safe_float(importance_scores[idx], default=0.0)
+            phenotypes_with_importance.append((node_key, str(display_name), importance))
+        
+        # Sort by importance (descending) and return top-k
+        phenotypes_with_importance.sort(key=lambda x: x[2], reverse=True)
+        return phenotypes_with_importance[:top_k]
+    
+    except Exception as e:
+        if DEBUG:
+            print(f"[DEBUG] Error extracting importance symptoms: {e}")
+        return []
+
+
+
+# ============================================================================
+# AGENT BUILDER & STATE NODES
+# ============================================================================
+
+def build_graph_agent(retriever: Retriever) -> StateGraph[AgentState]:
+    """Build LangGraph medical diagnosis agent.
+    
+    Agent flow: Rank → Route → (Clarify OR Answer) → END
+    """
+    retrieve_tool = make_retrieve_tool(retriever)
 
     def _disease_keys(item: Dict[str, Any]) -> List[str]:
-        s = item.get("id").strip()
-        return [s] if s else []
+        disease_id = item.get("id", "").strip()
+        return [disease_id] if disease_id else []
 
-    def _target_in_topk(res: List[Dict[str, Any]], target: Optional[str], k: int) -> bool:
+    def _target_in_topk(results: List[Dict[str, Any]], target: Optional[str], k: int) -> bool:
         if not target:
             return False
         target = target.strip()
-        for item in (res or [])[:k]:
-            if target in _disease_keys(item):
-                return True
-        return False
+        return any(target in _disease_keys(item) for item in (results or [])[:k])
 
-    def _target_anywhere(res: List[Dict[str, Any]], target: Optional[str]) -> bool:
+    def _target_anywhere(results: List[Dict[str, Any]], target: Optional[str]) -> bool:
         if not target:
             return False
         target = target.strip()
-        for item in (res or []):
-            if target in _disease_keys(item):
-                return True
-        return False
+        return any(target in _disease_keys(item) for item in (results or []))
 
-    def rank(state: AgentState) -> AgentState:
-        q = (state.get("combined_query") or state["user_query"]).strip()
-        pg = state.get("previous_groups")
-        pd = state.get("previous_diseases")
+    def node_rank(state: AgentState) -> AgentState:
+        """Stage 1: Retrieve disease candidates from knowledge graph."""
+        query = (state.get("combined_query") or state["user_query"]).strip()
+        previous_groups = state.get("previous_groups")
+        previous_diseases = state.get("previous_diseases")
 
-        res, flat_ranked, phenotype_texts, disease_in_nx_pairs, groups, previous_diseases, token_usage, time_taken = retrieve_tool.invoke({"query": q, "previous_groups": pg, "previous_diseases": pd})
-        res = sorted(res, key=lambda x: _safe_float(x.get("score", 0.0)), reverse=True)
+        (results, clustered, phenotypes, diseases, groups, prev_diseases, 
+         tokens, time_taken) = retrieve_tool.invoke({
+            "query": query,
+            "previous_groups": previous_groups,
+            "previous_diseases": previous_diseases,
+        })
+
+        results = sorted(results, key=lambda x: _safe_float(x.get("score", 0.0)), reverse=True)
 
         return {
             **state,
-            "results": res,
-            "clustering_result": flat_ranked,
-            "llm_entity_recognition_result": phenotype_texts,
-            "retrieved_diseases": disease_in_nx_pairs,
+            "results": results,
+            "clustering_result": clustered,
+            "llm_entity_recognition_result": phenotypes,
+            "retrieved_diseases": diseases,
             "previous_groups": groups,
-            "previous_diseases": previous_diseases,
-            "token_usage": token_usage,
+            "previous_diseases": prev_diseases,
+            "token_usage": tokens,
             "retrieval_time": time_taken,
         }
 
-    def clarify(state: AgentState) -> AgentState:
-        res = state.get("results") or []
+    def node_clarify(state: AgentState) -> AgentState:
+        """Stage 2: Generate targeted clarification questions."""
+        results = state.get("results") or []
         target = state.get("target_disease_id")
 
-        if not res:
+        if not results:
             return {
                 **state,
                 "need_clarification": True,
                 "final": (
-                    "I couldn't find any matching graphs. "
-                    "Can you add 1–2 more symptoms and (if possible) the affected body area?"
+                    "I couldn't find any medical conditions matching your symptoms. "
+                    "Please add 1-2 more specific symptoms and mention where you feel them."
                 ),
             }
 
         name_to_value = state.get("symptom_name_to_value") or {}
         norm_index = state.get("_symptom_norm_index") or {}
+        top_candidates = results[:TOPK_FOR_CLARIFY]
 
-        top_n = res[:TOPK_FOR_CLARIFY]
+        # Collect already-extracted symptoms
+        excluded: Set[str] = set()
+        for item in top_candidates:
+            excluded |= extract_phenotype_values_from_graph(
+                item.get("partial_graph"), name_to_value, norm_index
+            )
 
-        exclude_values: Set[str] = set()
+        current_query = (state.get("combined_query") or state.get("user_query") or "").strip()
+        user_ids, _ = extract_user_symptom_values_from_text(current_query, name_to_value, norm_index)
+        excluded |= user_ids
 
-        for item in top_n:
-            pg = item.get("partial_graph")
-            exclude_values |= extract_phenotype_values_from_graph(pg, name_to_value, norm_index)
+        # Collect candidate symptoms
+        candidates: List[str] = []
+        seen_ids: Set[str] = set()
 
-        base_text = (state.get("combined_query") or state.get("user_query") or "").strip()
-        user_values, _ = extract_user_symptom_values_from_text(base_text, name_to_value, norm_index)
-        exclude_values |= user_values
-
-        all_values: List[str] = []
-        seen_values: Set[str] = set()
-
-        for item in top_n:
-            cg = item.get("complete_graph")
-            symptom_names = extract_phenotype_names(cg, max_items=MAX_SYMPTOMS_IN_QUESTION)
-
-            for s in symptom_names:
-                v = map_symptom_to_value(s, name_to_value, norm_index)
-                if not v:
-                    continue
-                if v in exclude_values:
-                    continue
-                if v in seen_values:
-                    continue
-
-                seen_values.add(v)
-                all_values.append(v)
-
-                if len(all_values) >= MAX_SYMPTOMS_IN_QUESTION:
-                    break
-
-            if len(all_values) >= MAX_SYMPTOMS_IN_QUESTION:
+        for item in top_candidates:
+            if len(candidates) >= MAX_SYMPTOMS_IN_QUESTION:
                 break
+            complete_graph = item.get("complete_graph")
+            for symptom_name in extract_phenotype_names(complete_graph, max_items=MAX_SYMPTOMS_IN_QUESTION):
+                if len(candidates) >= MAX_SYMPTOMS_IN_QUESTION:
+                    break
+                symptom_id = map_symptom_to_value(symptom_name, name_to_value, norm_index)
+                if symptom_id and symptom_id not in excluded and symptom_id not in seen_ids:
+                    seen_ids.add(symptom_id)
+                    candidates.append(symptom_id)
 
-        header: List[str] = []
+        # Build message
+        lines: List[str] = []
         if target:
-            if not _target_anywhere(res, target):
-                header.append(f"(Target {target} is NOT in the candidate list yet.)")
+            if not _target_anywhere(results, target):
+                lines.append(f"⚠️  Target {target} not found in candidates.")
             else:
-                header.append(f"(Target {target} exists in candidates but NOT in top-{TOPK_FOR_CLARIFY}.)")
+                lines.append(f"⚠️  Target {target} exists but not in top-{TOPK_FOR_CLARIFY}.")
 
-        if all_values:
-            msg = "\n".join(
-                header
-                + [
-                    f"I need one more detail to disambiguate between the top {TOPK_FOR_CLARIFY} candidates.",
-                    "Do you have any of these additional symptoms (IDs)?",
-                    *[f"- {v}" for v in all_values],
-                    "",
-                    "Reply with the ones you have (or say 'none'), and also where you feel the pain.",
-                ]
-            )
+        if candidates:
+            lines.extend([
+                f"To narrow down the top {TOPK_FOR_CLARIFY} candidates, do you have any of these symptoms?",
+                *[f"  • {s}" for s in candidates],
+                "Please reply with the ones you have.",
+            ])
         else:
-            msg = "\n".join(
-                header
-                + [
-                    f"I need one more detail to disambiguate between the top {TOPK_FOR_CLARIFY} candidates.",
-                    "I already used your current symptoms.",
-                    "Can you share 1–2 additional symptoms (and where in the body you feel them)?",
-                ]
-            )
+            lines.extend([
+                f"To narrow down the top {TOPK_FOR_CLARIFY} candidates, please provide 1-2 additional symptoms.",
+                "Include information about the affected body area.",
+            ])
 
-        return {**state, "need_clarification": True, "final": msg}
+        return {**state, "need_clarification": True, "final": "\n".join(lines)}
 
     def route_after_rank(state: AgentState) -> str:
-        res = state.get("results") or []
+        """Route to clarify or answer based on confidence and target presence."""
+        results = state.get("results") or []
         target = state.get("target_disease_id")
 
         if target:
-            return "answer" if _target_in_topk(res, target, k=TOPK_FOR_CLARIFY) else "clarify"
+            return "answer" if _target_in_topk(results, target, k=TOPK_FOR_CLARIFY) else "clarify"
 
-        top_score = _safe_float(res[0].get("score", 0.0)) if res else 0.0
-        return "clarify" if top_score < THRESHOLD else "answer"
+        top_score = _safe_float(results[0].get("score", 0.0)) if results else 0.0
+        return "answer" if top_score >= CONFIDENCE_THRESHOLD else "clarify"
 
-    def answer(state: AgentState) -> AgentState:
-        res = state.get("results") or []
-        if not res:
-            return {**state, "need_clarification": False, "final": "No results found."}
+    def node_answer(state: AgentState) -> AgentState:
+        """Stage 3: Format final ranked disease candidates with top-importance symptoms."""
+        results = state.get("results") or []
+        if not results:
+            return {
+                **state,
+                "need_clarification": False,
+                "final": "No medical conditions matched your symptoms.",
+            }
 
         target = state.get("target_disease_id")
-        top_n = res[:TOPK_FOR_CLARIFY]
+        top = results[:TOPK_FOR_CLARIFY]
 
         lines: List[str] = []
-        for i, item in enumerate(top_n, start=1):
+        for rank, item in enumerate(top, start=1):
             did = item.get("disease_id") or item.get("id") or "unknown"
-            sc = _safe_float(item.get("score", 0.0))
-            mark = " ✅ TARGET" if (target and target in _disease_keys(item)) else ""
-            lines.append(f"{i}. {did} (score={sc:.6f}){mark}")
+            score = _safe_float(item.get("score", 0.0))
+            marker = " ✅ TARGET" if (target and target in _disease_keys(item)) else ""
+            
+            # Extract high-importance symptoms from complete graph
+            symptoms_text = ""
+            complete_graph = item.get("complete_graph")
+            if complete_graph:
+                top_symptoms = extract_top_importance_symptoms(complete_graph, top_k=3)
+                if top_symptoms:
+                    symptom_names = [s[1] for s in top_symptoms]
+                    symptoms_text = f" [Key symptoms: {', '.join(symptom_names)}]"
+            
+            lines.append(f"{rank}. {did} (score: {score:.6f}){marker}{symptoms_text}")
 
-        confident = [x for x in res if _safe_float(x.get("score", 0.0)) >= THRESHOLD][:MAX_DISEASES_IN_ANSWER]
+        main = "Top-3 disease candidates:\n" + "\n".join(lines)
+
+        # Add high-confidence candidates
+        high_conf = [
+            x for x in results
+            if _safe_float(x.get("score", 0.0)) >= CONFIDENCE_THRESHOLD
+        ][:MAX_DISEASES_IN_ANSWER]
+
         extra = ""
-        if confident:
-            best = _safe_float(confident[0].get("score", 0.0))
-            worst = _safe_float(confident[-1].get("score", 0.0))
-            extra_lines: List[str] = []
-            for i, item in enumerate(confident, start=1):
+        if high_conf:
+            best = _safe_float(high_conf[0].get("score", 0.0))
+            worst = _safe_float(high_conf[-1].get("score", 0.0))
+            conf_lines: List[str] = []
+            for rank, item in enumerate(high_conf, start=1):
                 did = item.get("disease_id") or item.get("id") or "unknown"
-                sc = _safe_float(item.get("score", 0.0))
-                extra_lines.append(f"{i}. {did} (score={sc:.2f})")
+                score = _safe_float(item.get("score", 0.0))
+                
+                # Extract high-importance symptoms from complete graph
+                symptoms_text = ""
+                complete_graph = item.get("complete_graph")
+                if complete_graph:
+                    top_symptoms = extract_top_importance_symptoms(complete_graph, top_k=2)
+                    if top_symptoms:
+                        symptom_names = [s[1] for s in top_symptoms]
+                        symptoms_text = f" [Key: {', '.join(symptom_names)}]"
+                
+                conf_lines.append(f"{rank}. {did} (score: {score:.2f}){symptoms_text}")
+
             extra = (
-                "\n\n"
-                f"Also {len(confident)} candidates with score ≥ {THRESHOLD} "
-                f"(range: {worst:.2f} → {best:.2f}).\n"
-                + "\n".join(extra_lines)
+                f"\n\n**Additional candidates (score ≥ {CONFIDENCE_THRESHOLD}):**\n"
+                f"Found {len(high_conf)} conditions (range: {worst:.2f} → {best:.2f})\n"
+                + "\n".join(conf_lines)
             )
 
         return {
             **state,
             "need_clarification": False,
-            "final": "Top-3 candidates:\n" + "\n".join(lines) + extra,
+            "final": main + extra,
         }
 
-    g = StateGraph(AgentState)
-    g.add_node("rank", rank)
-    g.add_node("clarify", clarify)
-    g.add_node("answer", answer)
+    # Build and compile graph
+    graph = StateGraph(AgentState)
+    graph.add_node("rank", node_rank)
+    graph.add_node("clarify", node_clarify)
+    graph.add_node("answer", node_answer)
 
-    g.set_entry_point("rank")
-    g.add_conditional_edges("rank", route_after_rank, {"clarify": "clarify", "answer": "answer"})
-    g.add_edge("clarify", END)
-    g.add_edge("answer", END)
+    graph.set_entry_point("rank")
+    graph.add_conditional_edges("rank", route_after_rank, {"clarify": "clarify", "answer": "answer"})
+    graph.add_edge("clarify", END)
+    graph.add_edge("answer", END)
 
-    return g.compile()
+    return graph.compile()
 
-# ============================================================
-# CLI Runner
-# ============================================================
+
+# ============================================================================
+# INTERACTIVE CONVERSATION RUNNER
+# ============================================================================
 
 def run_interactive(
-    agent,
+    agent: StateGraph[AgentState],
     first_query: str,
     *,
     target_disease_id: Optional[str] = None,
     max_rounds: int = 8
 ) -> None:
-    """
-    Updated runner that prints target disease position after each iteration.
+    """Run interactive multi-round diagnosis conversation.
+    
+    Args:
+        agent: Compiled LangGraph agent
+        first_query: Initial user symptom query
+        target_disease_id: Expected disease ID (for evaluation)
+        max_rounds: Maximum conversation rounds
     """
 
     def _disease_keys(item: Dict[str, Any]) -> List[str]:
-        s = item.get("id").strip()
-        return [s] if s else []
+        disease_id = item.get("id", "").strip()
+        return [disease_id] if disease_id else []
 
-    def _target_rank(res: List[Dict[str, Any]], target: Optional[str]) -> Optional[int]:
-        """
-        Returns 1-based rank of target in res if found, else None.
-        Matches inside composite ids like "disease:a_b_c".
-        """
+    def _target_rank(results: List[Dict[str, Any]], target: Optional[str]) -> Optional[int]:
         if not target:
             return None
         target = target.strip()
-        for i, item in enumerate(res or [], start=1):
-            if target in _disease_keys(item):
-                return i
-        return None
+        return next((i for i, item in enumerate(results or [], start=1) 
+                    if target in _disease_keys(item)), None)
 
     mapping_state = build_mapping_state(SYMPTOM_MAPPING_PATH)
-
     state: AgentState = {
         **mapping_state,
         "user_query": first_query,
@@ -572,39 +666,30 @@ def run_interactive(
     }
 
     for round_num in range(max_rounds):
-        out: AgentState = agent.invoke(state)
+        output_state: AgentState = agent.invoke(state)
+        print("\n" + (output_state.get("final") or ""))
 
-        print("\n" + (out.get("final") or ""))
-
-        res = out.get("results") or []
+        results = output_state.get("results") or []
         if target_disease_id:
-            r = _target_rank(res, target_disease_id)
-            top3 = [
-                str((res[i].get("disease_id") or res[i].get("id") or "unknown"))
-                for i in range(min(3, len(res)))
+            rank = _target_rank(results, target_disease_id)
+            top_3 = [
+                str(results[i].get("disease_id") or results[i].get("id") or "unknown")
+                for i in range(min(3, len(results)))
             ]
-            if r is None:
-                print(f"\n[Target rank] {target_disease_id}: NOT FOUND (list size={len(res)})")
+            if rank is None:
+                print(f"\n[Target Rank] {target_disease_id}: NOT FOUND (total: {len(results)})")
             else:
-                print(f"\n[Target rank] {target_disease_id}: {r}/{len(res)}")
-            print("[Top-3]", " | ".join(top3))
+                print(f"\n[Target Rank] {target_disease_id}: {rank}/{len(results)}")
+            print("[Top-3]", " | ".join(top_3))
 
-        if not out.get("need_clarification"):
+        if not output_state.get("need_clarification"):
             return
 
-        follow = input("\nYour reply: ").strip()
-
-        new_user_query = follow
-
-        if DEBUG:
-            print(f"\n[DEBUG Round {round_num + 1}]")
-            print(f"  User said: {follow}")
-            print(f"  Updated user_query: {new_user_query}")
-
+        clarification = input("\nYour response: ").strip()
         state = {
             **state,
-            "user_query": new_user_query,
-            "followup_query": follow,
+            "user_query": clarification,
+            "followup_query": clarification,
             "combined_query": None,
             "results": None,
             "clustering_result": [],
@@ -612,23 +697,45 @@ def run_interactive(
             "retrieved_diseases": [],
             "final": None,
             "token_usage": None,
-            "previous_groups": out.get("previous_groups") or [],
-            "previous_diseases": out.get("previous_diseases") or [],
+            "previous_groups": output_state.get("previous_groups") or [],
+            "previous_diseases": output_state.get("previous_diseases") or [],
             "target_disease_id": target_disease_id,
         }
 
+        if DEBUG:
+            print(f"\n[DEBUG Round {round_num + 1}] User input: {clarification}")
+
     print(
-        "\nI still don't have enough signal. Please add more details "
-        "(duration, severity, fever, vomiting, location)."
+        "\nI need more specific information to provide an accurate diagnosis.\n"
+        "Please describe:\n"
+        "  • Duration (how long?)\n"
+        "  • Severity (mild, moderate, severe)\n"
+        "  • Body locations affected\n"
+        "  • Associated symptoms (fever, vomiting, etc.)\n"
     )
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     chat = ChatCompletion(settings)
     retriever = Retriever(settings, chat)
     retriever.build_clusters()
-    mapping_state = build_mapping_state(SYMPTOM_MAPPING_PATH)
 
     agent = build_graph_agent(retriever)
-    first_query = "My child has been peeing a lot and seems smaller than other kids the same age. Could polyuria from the kidney be related to short stature?"
-    run_interactive(agent, first_query=first_query, max_rounds=5, target_disease_id="disease:10204")
+
+    example_query = (
+        "My child has been urinating very frequently and appears smaller than "
+        "children of the same age. Could polyuria affecting the kidney be related to short stature?"
+    )
+
+    run_interactive(
+        agent,
+        first_query=example_query,
+        max_rounds=5,
+        target_disease_id="disease:10204"
+    )
+
 
