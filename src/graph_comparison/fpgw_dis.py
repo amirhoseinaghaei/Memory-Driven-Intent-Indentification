@@ -98,7 +98,6 @@ def compute_partial_importance_compatible(
     complete_node_importance,
     A_tgt,
 ):
-    target_prior = compute_node_importance(A_tgt)
 
     complete_map = {
         nid: complete_node_importance[i]
@@ -146,8 +145,8 @@ def pflgw_directed_distance(
     complete_node_ids,
     partial_node_ids,
     alpha=0.5,
-    mismatch_cost=1.0,
-    numItermax=1000,
+    mismatch_cost=1,
+    numItermax=2000,
 ):
     """
     Computes the Partial Fused Gromov-Wasserstein distance between two directed graphs.
@@ -226,3 +225,78 @@ def pflgw_directed_distance(
     except Exception as e:
         print("[ERROR]", e)
         return float('inf'), None, None, None
+
+
+# def pflgw_directed_distance(
+#     A_ref,
+#     A_tgt,
+#     complete_node_ids,
+#     partial_node_ids,
+#     alpha=0.5,
+#     mismatch_cost=1,
+#     numItermax=2000,
+# ):
+#     """
+#     Computes the Partial Fused Gromov-Wasserstein distance between two directed graphs.
+
+#     Returns:
+#         dist: Raw optimal transport cost (lower = more similar)
+#         gamma: Transport plan
+#         p, q: Uniform marginals
+#     """
+#     try:
+#         A_ref = np.asarray(A_ref, dtype=np.float64)
+#         A_tgt = np.asarray(A_tgt, dtype=np.float64)
+
+#         n_complete = A_ref.shape[0]
+#         n_partial = A_tgt.shape[0]
+
+#         if n_complete == 0 or n_partial == 0:
+#             return 0.0, None, None, None
+
+#         if len(complete_node_ids) != n_complete or len(partial_node_ids) != n_partial:
+#             raise ValueError("Node id list length must match adjacency size.")
+
+#         # ── Directed structural cost matrices
+#         C_ref = adj_to_directed_geodesic_cost(A_ref)
+#         C_tgt = adj_to_directed_geodesic_cost(A_tgt)
+
+#         scale = max(C_ref.max(), C_tgt.max(), 1e-12)
+#         C_ref = C_ref / scale
+#         C_tgt = C_tgt / scale
+
+#         # ── Uniform distributions
+#         p = np.ones(n_complete, dtype=np.float64) / n_complete
+#         q = np.ones(n_partial, dtype=np.float64) / n_partial
+
+#         # ── Feature cost
+#         M = build_identity_feature_cost(
+#             complete_node_ids,
+#             partial_node_ids,
+#             mismatch_cost=mismatch_cost,
+#         )
+
+#         # ── Partial mass
+#         m = min(p.sum(), q.sum())   # usually = 1.0
+
+#         # ── Optimization
+#         dist, log = ot.gromov.partial_fused_gromov_wasserstein2(
+#             M,
+#             C_ref,
+#             C_tgt,
+#             p,
+#             q,
+#             m=m,
+#             alpha=alpha,
+#             loss_fun="square_loss",
+#             numItermax=numItermax,
+#             log=True,
+#         )
+
+#         gamma = log["T"]
+
+#         return float(dist), gamma, p, q
+
+#     except Exception as e:
+#         print("[ERROR]", e)
+#         return float("inf"), None, None, None

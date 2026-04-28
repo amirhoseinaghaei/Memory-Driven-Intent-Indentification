@@ -14,6 +14,11 @@ from sklearn.preprocessing import normalize
 from src.data_models.neo4j_conf import Neo4jConfig
 from src.gen_ai_gateway.embedder import Embed
 from src.graph_comparison.fpgw_dis import pflgw_directed_distance
+# from src.graph_comparison.fpgw_dis2 import pflgw_directed_distance
+
+
+
+# from src.graph_comparison.fgw_dist import fgw_directed_distance
 from src.utils.helpers import (
     safe_parse_llm_json,
     _strip_embeddings,
@@ -89,8 +94,8 @@ def _build_ner_messages(query: str, ranked: list) -> list:
                 "- Use meaning-based matching, not exact keywords.\n\n"
                 "Hard rules:\n"
                 "1) Choose ONLY from the Symptom List (never invent symptoms).\n"
-                "2) Return minimum 3 and AT MOST 15 symptoms total.\n"
-                "3) For each symptom, list EXACTLY 3 organs from organ list "
+                "2) Return minimum 1 and AT MOST 3 symptoms total.\n"
+                "3) For each symptom, list 1 of the most directly affected organs"
                 "that are implicated by that symptom.\n"
                 f"Symptom List (flat list):\n{ranked}\n\n"
                 f"Organ List:\n{organ_list}\n\n"
@@ -916,7 +921,10 @@ class Retriever:
             response = self.chat.create_response(message=messages)
             self.token_counter.add_llm(getattr(response, "usage", None))
             raw = (response.choices[0].message.content or "").strip()
+            if "```json" in raw:
+                raw = raw.split("```json")[-1].rsplit("```", 1)[0].strip()
             ph_to_an_inputs = safe_parse_llm_json(raw) or {}
+            print(ph_to_an_inputs)
             phenotype_texts = [k for k in ph_to_an_inputs if k]
 
             if not phenotype_texts:
@@ -1046,9 +1054,8 @@ class Retriever:
                 score, gamma, p, q = pflgw_directed_distance(
                     A_ref=CA_,
                     A_tgt=PA_,
-                    complete_node_ids=CN,
-                    partial_node_ids=PN,
-                )
+                    complete_node_ids=CN,   
+                    partial_node_ids=PN,)
 
                 return {
                     "score": score,
