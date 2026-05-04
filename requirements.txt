@@ -1,17 +1,39 @@
-pot
-openai
-tqdm
-torch 
-neo4j
-pandas
-rapidfuzz
-pyvis
-pydantic_settings
-requests
-langchain_core
-matplotlib
-sentence_transformers 
-langchain_openai 
-langgraph
-hdbscan
-networkx
+# Core scientific computing
+numpy>=1.24
+scipy>=1.11
+
+# Optimal transport (PFLGW distance — key contribution)
+POT>=0.9
+
+# Deep learning & embeddings
+torch>=2.0
+sentence-transformers>=3.0
+
+# LLM & agent framework
+openai>=1.0
+langchain-core>=0.2
+langchain-openai>=0.1
+langgraph>=0.2
+
+# Graph database
+neo4j>=5.0
+networkx>=3.0
+
+# Clustering
+hdbscan>=0.8
+umap-learn>=0.5
+scikit-learn>=1.3
+
+# Data handling
+pandas>=2.0
+openpyxl>=3.1
+tqdm>=4.0
+
+# Configuration & utilities
+pydantic-settings>=2.0
+requests>=2.0
+rapidfuzz>=3.0
+
+# Visualization
+pyvis>=0.3
+matplotlib>=3.7

@@ -14,11 +14,9 @@ from sklearn.preprocessing import normalize
 from src.data_models.neo4j_conf import Neo4jConfig
 from src.gen_ai_gateway.embedder import Embed
 from src.graph_comparison.fpgw_dis import pflgw_directed_distance
-# from src.graph_comparison.fpgw_dis2 import pflgw_directed_distance
 
 
 
-# from src.graph_comparison.fgw_dist import fgw_directed_distance
 from src.utils.helpers import (
     safe_parse_llm_json,
     _strip_embeddings,
