@@ -46,8 +46,6 @@ class Embed:
 
         for attempt in range(self.max_retries + 1):
             try:
-                print(f"POST {self.embed_url}")
-                print(f"Payload: {payload}")
                 resp = self.session.post(
                     self.embed_url,
                     json=payload,

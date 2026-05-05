@@ -1,207 +1,224 @@
-# 🩺 Medical Graph Agent
+# Memory-Driven Intent Identification for Medical Diagnosis
 
-A sophisticated AI-powered medical diagnosis assistant that leverages graph databases and advanced retrieval techniques to help identify potential diseases based on user-described symptoms. Built with Neo4j, LangGraph, and OpenAI embeddings for accurate and explainable medical querying.
+> Official implementation for the NeurIPS paper:
+> **"Better Reasoning, Not Just Bigger Models: A Structure-Grounded Framework for Efficient and Reliable Inference"**
+> [[Paper](#)] 
 
-## ✨ Features
+---
 
-- **Graph-Based Retrieval**: Utilizes Neo4j graph database to model complex relationships between diseases, symptoms, genes, and drugs
-- **Intelligent Clustering**: Employs UMAP and HDBSCAN for phenotype clustering to improve retrieval accuracy
-- **Interactive Agent**: LangGraph-powered conversational agent that can clarify symptoms and provide ranked disease candidates
-- **Embedding-Powered Search**: Sentence Transformers for semantic similarity matching
-- **Modular Architecture**: Clean separation of concerns with dedicated modules for indexing, retrieval, and agent logic
+## Abstract
 
-## 📋 Prerequisites
+While scaling large language models has driven substantial gains in linguistic fluency, building reliable autonomous agents requires more than larger parameter counts. Current agentic systems often produce semantically plausible yet structurally ungrounded reasoning, leading to unreliable multi-turn inference under partial and noisy observations. We introduce \textbf{Structure-Grounded Uncertainty Reduction (SGUR)}, a training-free framework that reformulates sequential reasoning as uncertainty reduction over a structured latent hypothesis space. SGUR organizes domain knowledge into a hierarchical four-layer graph and aligns fragmented evidence to candidate hypothesis graphs through a Partial Fused Gromov--Wasserstein discrepancy, which jointly captures semantic and relational correspondence while tolerating incomplete observations through an overlap-aware mass budget. This geometric alignment is coupled with an information-gain-driven acquisition strategy that actively selects the most discriminative next observation, and with conformal risk control for calibrated, uncertainty-aware predictions.Evaluated on a demanding sequential clinical diagnosis benchmark derived from PrimeKG, SGUR achieves \textbf{92.5\% Hit@3} under sparse two-symptom queries, a $9.4$-point absolute gain over the strongest graph-RAG baseline, while consuming roughly $5\times$ fewer tokens and converging in fewer interaction rounds (MTTC $1.62$ vs.\ $\geq 1.74$). Component-wise ablations confirm that latent routing, partial transport, and information-theoretic node weighting each contribute substantially, with their effect most pronounced in data-sparse regimes. Notably, SGUR with a small backbone (Haiku~3, GPT-5.4-nano) matches or exceeds the accuracy of every baseline run on substantially larger models, retaining over $99\%$ of its Hit@3 across model scales. These results suggest that reliable agent performance depends not only on model scale, but on the structural quality of the reasoning framework organizing inference.
+---
 
-- Python 3.8+
-- Neo4j 5.x (Community or Enterprise)
-- OpenAI API access (or compatible API)
-- Sufficient RAM for embeddings processing (8GB+ recommended)
+## Method Overview
 
-## 🚀 Installation
+This repository implements a memory-driven, multi-round conversational agent for rare disease identification from natural language symptom descriptions. The system models patient-reported symptoms as a directed graph and compares it against a disease knowledge graph using a  **Partial Fused Gromov-Wasserstein (PFLGW)** distance metric.
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd memory_project
-   ```
+Key components:
 
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+- **Knowledge Graph**: Neo4j-backed graph encoding diseases, phenotypes, anatomical locations, genes, and drugs with typed edges.
+- **Graph-Based Retrieval**: Retrieval is framed as an optimal transport problem. The PFLGW distance compares the patient symptom graph (partial, noisy) against each disease reference graph (complete).
+- **Memory-Driven Agent**: A LangGraph agent maintains a session memory of previously seen symptom clusters and candidate diseases across dialogue turns.
+- **Multi-Round Evaluation**: Three successive queries simulate a realistic clinical dialogue, with cumulative top-k accuracy measured at each round.
 
-3. **Set up Neo4j**:
-   - Download and install Neo4j from [neo4j.com](https://neo4j.com/download/)
-   - Start Neo4j with default credentials (neo4j/neo4j) and change password
-   - Note the bolt URI (default: `neo4j://localhost:7687`)
+---
 
-## ⚙️ Configuration
+## Repository Structure
 
-1. **Configure API credentials**:
-   Edit `src/config/config.json` with your API endpoints and keys:
-   ```json
-   {
-     "API_KEY": "your-openai-api-key",
-     "API_BASE": "https://api.openai.com/v1",
-     "MODEL_NAME": "gpt-4",
-     "EMBEDDING_API_BASE": "https://api.openai.com/v1",
-     "EMBEDDING_MODEL": "text-embedding-3-large",
-     "NEO4J_URI": "neo4j://localhost:7687",
-     "NEO4J_USER": "neo4j",
-     "NEO4J_PASSWORD": "your-neo4j-password"
-   }
-   ```
-
-2. **Verify data files**:
-   Ensure the following data files are present in the project root:
-   - `phenotype_disease.csv`
-   - `gene_disease.csv`
-   - `drug_disease.csv`
-   - `dataset/phenotype_catalog.json`
-
-## 🔄 Indexing the Data
-
-The indexing process builds the knowledge graph and prepares embeddings for efficient retrieval.
-
-### Step 1: Preprocess Disease Data
-Run the preprocessing scripts to build disease mappings:
-```bash
-python -m src.preprocessing.build_disease
-python -m src.preprocessing.build_disease_rel
-python -m src.preprocessing.build_gene_anatomy
+```
+.
+├── test_cases/                        # Evaluation benchmarks
+│   ├── complex_scenario_questions.xlsx   # Multi-round complex queries
+│   ├── simple_scenario_questions.xlsx    # Single-round simple queries
+├── src/
+│   ├── config/                     # Configuration loader and template
+│   ├── data_generation/            # Scripts for generating evaluation questions
+│   ├── data_models/                # Pydantic data models for graph schema
+│   ├── db_managers/                # Neo4j graph client
+│   ├── gen_ai_gateway/             # LLM and embedding API wrappers
+│   ├── graph_comparison/           # PFLGW distance implementation (key contribution)
+│   │   └── fpgw_dis.py             # Partial Fused Gromov-Wasserstein distance
+│   ├── indexing_pipeline/          # Knowledge graph construction pipeline
+│   ├── evaluation/                 # Evaluation harness and runner
+│   ├── medical_agent/              # LangGraph agent and tools
+│   ├── retrieval/                  # Retriever combining embeddings + graph distance
+│   └── utils/
+├── requirements.txt
+└── README.md
 ```
 
-### Step 2: Ingest Data into Neo4j
-Use the indexing pipeline to populate the graph database:
+---
+
+## Requirements
+
+**System requirements:**
+- Python 3.10+
+- Neo4j 5.x (Community Edition is sufficient)
+- 8 GB+ RAM (16 GB recommended for embedding indexing)
+
+**Install dependencies:**
+
 ```bash
-# Note: Adjust paths and parameters as needed
-python -c "
-from src.indexing_pipeline.pipeline import run_extraction
-from pathlib import Path
-run_extraction(
-    input_dir=Path('data_directory'),
-    schema_path=Path('src/indexing_pipeline/schema.json'),
-    output_dir=Path('output'),
-    api_key='your-api-key',
-    model='gpt-4',
-    api_base='https://api.openai.com/v1'
-)
-"
+pip install -r requirements.txt
 ```
 
-### Step 3: Build Phenotype Clusters
-Initialize the retriever and build clusters for improved symptom matching:
+---
+
+## Setup
+
+### 1. Neo4j
+
+Download Neo4j from [neo4j.com/download](https://neo4j.com/download/) and start a local instance:
+
+```bash
+neo4j start
+```
+
+Default bolt URI: `neo4j://localhost:7687`. Set a password when prompted.
+
+### 2. Configuration
+
+Copy the template and fill in your credentials:
+
+```bash
+cp src/config/config.json.example src/config/config.json
+```
+
+Edit `src/config/config.json`:
+
+```json
+{
+  "API_KEY": "your-openai-api-key",
+  "API_BASE": "https://api.openai.com/v1",
+  "MODEL_NAME": "gpt-4o",
+  "NO_THINK_MODEL_NAME": "gpt-4o",
+  "TEMPERATURE": 0,
+  "MAX_OUTPUT_TOKEN": 4096,
+  "EMBEDDING_API_BASE": "https://api.openai.com/v1",
+  "EMBEDDING_MODEL": "text-embedding-3-large",
+  "NEO4J_URI": "neo4j://localhost:7687",
+  "NEO4J_USER": "neo4j",
+  "NEO4J_PASSWORD": "your-neo4j-password"
+}
+```
+
+> `src/config/config.json` is excluded from version control via `.gitignore`.
+
+---
+
+## Building the Knowledge Graph
+
+Place your expert knowledge documents in the `input/` folder, then run the indexing pipeline to extract entities and build the Neo4j graph:
+
+```bash
+python -m src.indexing_pipeline.pipeline \
+  --input_dir input/ \
+  --schema_path src/indexing_pipeline/schema.json \
+  --output_dir output/ \
+  --embed_nodes
+```
+
+See [src/indexing_pipeline/README.md](src/indexing_pipeline/README.md) for full pipeline documentation.
+
+---
+
+## Reproducing Evaluation Results
+
+### Prerequisites
+
+Before running evaluation, the Neo4j knowledge graph must be built and the retriever clusters must be initialized (done automatically on first run).
+
+### Configure the evaluation script
+
+Open `src/evaluation/run_evaluation.py` and set the absolute path to the evaluation dataset:
+
 ```python
-from src.config.config import settings
-from src.retrieval.retriever import Retriever
-from src.gen_ai_gateway.chat_completion import ChatCompletion
-
-chat = ChatCompletion(settings)
-retriever = Retriever(settings, chat)
-retriever.build_clusters()
+excel_path="dataset/complex_scenario_questions.xlsx",
 ```
 
-## 🏃 Running the Agent
+> **Note:** The current file contains a hardcoded absolute path that must be updated to match your local installation before running.
 
-### Interactive Mode
-Run the medical agent in interactive mode for symptom-based disease querying:
+### Run evaluation
+
 ```bash
-python -m src.medical_agent.agent
+python -m src.evaluation.run_evaluation
 ```
 
-The agent will:
-1. Accept symptom descriptions
-2. Retrieve and rank potential diseases
-3. Ask clarifying questions if needed
-4. Provide top disease candidates with confidence scores
+This evaluates the agent on the complex scenario benchmark over three rounds and prints cumulative top-3 accuracy per round.
 
-### Example Query
-```
-My child has been peeing a lot and seems smaller than other kids the same age. Could polyuria from the kidney be related to short stature?
-```
-
-### Programmatic Usage
-```python
-from src.config.config import settings
-from src.medical_agent.agent import build_graph_agent
-from src.retrieval.retriever import Retriever
-from src.gen_ai_gateway.chat_completion import ChatCompletion
-
-# Initialize components
-chat = ChatCompletion(settings)
-retriever = Retriever(settings, chat)
-retriever.build_clusters()
-agent = build_graph_agent(retriever)
-
-# Query the agent
-result = agent.invoke({
-    "user_query": "fever, cough, fatigue",
-    "previous_groups": [],
-    "previous_diseases": []
-})
-print(result["final"])
-```
-
-## 📊 Understanding Results
-
-The agent returns:
-- **Top-3 Candidates**: Most likely diseases with similarity scores
-- **Confidence Threshold**: Diseases with score ≥ 0.99 are considered confident matches
-- **Clarification Requests**: Additional symptoms needed for better disambiguation
-- **Target Tracking**: If testing with known diseases, shows target disease rank
-
-## 🛠️ Architecture Overview
-
-This project is designed so a user can describe symptoms naturally and receive a medical-style response backed by graph retrieval and embeddings.
-
-1. **User input**: A person enters symptoms, context, or a health concern.
-2. **Agent receives the query**: The LangGraph-based medical agent parses the input, understands intent, and decides whether it has enough information.
-3. **Retrieval layer**: The agent uses semantic embeddings and phenotype clusters to search the Neo4j graph for related diseases, symptoms, genes, and drugs.
-4. **Clarification loop**: If the initial query is ambiguous, the agent asks follow-up questions to narrow the diagnosis.
-5. **Response generation**: The agent ranks candidate diseases and returns the top matches, confidence scores, and any requested clarifications.
+### Expected output format
 
 ```
-User Input
-   │
-   ▼
-Medical Agent (LangGraph)
-   │
-   ├─> Query Parser + Intent Understanding
-   │
-   ├─> Retrieval Engine
-   │      ├─ Embeddings Search
-   │      └─ Phenotype Clustering
-   │
-   └─> Response Formatter
-          ├─ Top disease candidates
-          ├─ Confidence scores
-          └─ Follow-up questions
-   │
-   ▼
-Neo4j Graph Database
-   └─> Disease, Symptom, Gene, Drug relationships
+=== SUMMARY ===
+{
+  "N": 202,
+  "topk": 3,
+  "exclusive": {
+    "round1_accuracy": X.XX,
+    "round2_accuracy": X.XX,
+    "round3_accuracy": X.XX
+  },
+  "cumulative": {
+    "solved_by_round2_accuracy": X.XX,
+    "solved_by_round3_accuracy": X.XX
+  }
+}
 ```
 
-### User interaction flow
+---
 
-- The user starts by typing symptoms or a health concern.
-- The agent analyzes the text and performs a semantic search over the medical graph.
-- If needed, the agent asks the user one or more clarifying questions.
-- The user answers, and the agent refines its candidate ranking.
-- The agent then returns the best disease candidates, with supporting information and confidence levels.
+## Results
 
-## 🤝 Contributing
+Main results on the complex scenario benchmark (top-3 accuracy):
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+| Method             | Round 1 | By Round 2 | By Round 3 |
+|--------------------|---------|------------|------------|
+| Semantic only      |         |            |            |
+| + Graph structure  |         |            |            |
+| + PFLGW (ours)     |         |            |            |
 
-## 📄 License
+> Results vary by LLM backend. See the paper for full ablation tables.
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+---
 
-## ⚠️ Disclaimer
+## Dataset
 
-This tool is for research and educational purposes only. It is not a substitute for professional medical advice, diagnosis, or treatment. Always consult with qualified healthcare providers for medical concerns.
+The evaluation datasets are in `dataset/`:
+
+| File | Description |
+|------|-------------|
+| `complex_scenario_questions.xlsx` | 202 multi-round diagnostic questions with 3 progressive symptom queries per disease |
+| `simple_scenario_questions.xlsx` | Single-round queries with direct symptom lists |
+
+Each row in the question files contains:
+- `disease_id` — target disease identifier
+- `question1`, `question2`, `question3` — progressive natural-language symptom queries
+- `symptoms_used_q1/2/3` — comma-separated canonical symptom terms used per round
+
+---
+
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@inproceedings{[CITATION_KEY],
+  title     = {[PAPER TITLE]},
+  author    = {[AUTHORS]},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2026}
+}
+```
+
+---
+
+## License
+
+This project is licensed under the MIT License.
+
+---
+
+## Disclaimer
+
+This tool is intended for research purposes only. It is not a substitute for professional medical advice, diagnosis, or treatment.

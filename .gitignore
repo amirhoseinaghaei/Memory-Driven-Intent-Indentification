@@ -8,6 +8,7 @@
 *.xlsx
 *.log
 archive/
+.venv/
 .venv2/
 hipporag_index/
 /home/amiraghaei/memory-driven-intention-identification-agent/src/config/config.json

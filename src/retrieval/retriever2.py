@@ -1,25 +1,22 @@
 from __future__ import annotations
-
-import ast
 import json
 import logging
-import math
 import time
 from pathlib import Path
-from math import e, log
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Literal
-
+from typing import Any, Dict, List, Optional, Set, Tuple, Literal
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 import hdbscan
 import numpy as np
 import umap
 from neo4j import GraphDatabase, Driver
 from sklearn.preprocessing import normalize
-from src.config.config import settings
 from src.data_models.neo4j_conf import Neo4jConfig
 from src.gen_ai_gateway.embedder import Embed
-from src.gen_ai_gateway.chat_completion import ChatCompletion
-from src.graph_comparison.weighted_coverage import weighted_coverage
-from src.graph_comparison.new_linear_gw import pflgw_directed_distance
+from src.graph_comparison.fpgw_dis import pflgw_directed_distance
+
+
+
 from src.utils.helpers import (
     safe_parse_llm_json,
     _strip_embeddings,
@@ -29,24 +26,13 @@ from src.utils.helpers import (
     _to_nx_complete_graph,
 )
 
-
-import json
-import math
-import time
-import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Set, Tuple
-
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 # ── tuneable ──────────────────────────────────────────────────────────────────
-_SCORE_WORKERS  = 8   # threads for flgw scoring  (CPU-bound but releases GIL via numpy)
-_MATCH_WORKERS  = 8   # threads for anatomy matching
-_SAVE_WORKERS   = 4   # threads for fire-and-forget disk saves
+_SCORE_WORKERS = 8
+_MATCH_WORKERS = 8
+_SAVE_WORKERS = 4
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -56,8 +42,6 @@ logging.basicConfig(
 )
 
 
-
-# ── helper: build NER prompt (extracted to reduce method size) ─────────────────
 def _build_ner_messages(query: str, ranked: list) -> list:
     organ_list = (
         "['uterine cervix', 'islet of Langerhans', 'pituitary gland', 'zone of skin', 'lymph node', "
@@ -108,8 +92,8 @@ def _build_ner_messages(query: str, ranked: list) -> list:
                 "- Use meaning-based matching, not exact keywords.\n\n"
                 "Hard rules:\n"
                 "1) Choose ONLY from the Symptom List (never invent symptoms).\n"
-                "2) Return minimum 3 and AT MOST 15 symptoms total.\n"
-                "3) For each symptom, list EXACTLY 3 organs from organ list "
+                "2) Return minimum 1 and AT MOST 3 symptoms total.\n"
+                "3) For each symptom, list 1 of the most directly affected organs"
                 "that are implicated by that symptom.\n"
                 f"Symptom List (flat list):\n{ranked}\n\n"
                 f"Organ List:\n{organ_list}\n\n"
@@ -120,22 +104,18 @@ def _build_ner_messages(query: str, ranked: list) -> list:
         {"role": "user", "content": query},
     ]
 
-from dataclasses import dataclass, field
 
 @dataclass
 class TokenCounter:
-    llm_input_tokens:  int = 0
+    llm_input_tokens: int = 0
     llm_output_tokens: int = 0
-    embed_tokens:      int = 0
+    embed_tokens: int = 0
 
     def add_llm(self, usage) -> None:
-        """Pass response.usage directly from create_response()."""
         if usage is None:
             return
-        self.llm_input_tokens  += getattr(usage, "prompt_tokens",     0) or \
-                                   getattr(usage, "input_tokens",      0) or 0
-        self.llm_output_tokens += getattr(usage, "completion_tokens",  0) or \
-                                   getattr(usage, "output_tokens",     0) or 0
+        self.llm_input_tokens += getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0
+        self.llm_output_tokens += getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0
 
     def reset(self) -> None:
         self.llm_input_tokens = 0
@@ -143,18 +123,16 @@ class TokenCounter:
         self.embed_tokens = 0
 
     def add_embed(self, texts: list[str]) -> None:
-        """Estimate tokens for a list of strings (cache misses only)."""
-        # ~0.75 words per token is a reasonable approximation
         for t in texts:
             self.embed_tokens += max(1, round(len((t or "").split()) / 0.75))
 
     def summary(self) -> dict:
         total = self.llm_input_tokens + self.llm_output_tokens + self.embed_tokens
         return {
-            "llm_input_tokens":  self.llm_input_tokens,
+            "llm_input_tokens": self.llm_input_tokens,
             "llm_output_tokens": self.llm_output_tokens,
-            "embed_tokens":      self.embed_tokens,
-            "total_tokens":      total,
+            "embed_tokens": self.embed_tokens,
+            "total_tokens": total,
         }
 
 
@@ -173,6 +151,7 @@ MATCH (a:Entity {label:"anatomy"})
 RETURN a.id AS node_id, count(DISTINCT d) AS Z
 """
 
+
 class Retriever:
     def __init__(self, settings, chat, database: str = "neo4j") -> None:
         self._config = Neo4jConfig(
@@ -180,9 +159,8 @@ class Retriever:
             user=settings.NEO4J_USER,
             password=settings.NEO4J_PASSWORD,
             database=database,
-  
         )
-        self.token_counter = TokenCounter()   # ← add this line
+        self.token_counter = TokenCounter()
         self._driver: Driver = GraphDatabase.driver(
             settings.NEO4J_URI,
             auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
@@ -220,8 +198,7 @@ class Retriever:
         if key in self._emb_cache:
             return self._emb_cache[key]
         v = self.embedder.embed_query(text)
-        self.token_counter.add_embed([text])   # ← add this line
-
+        self.token_counter.add_embed([text])
         self._emb_cache[key] = v
         return v
 
@@ -238,7 +215,6 @@ class Retriever:
 
         for idx, item in enumerate(items):
             disease_id = item.get("id") or str(idx)
-            # Sanitize disease_id for filename
             safe_disease_id = str(disease_id).replace("/", "_").replace("\\", "_").replace(":", "_")
             file_path = out_dir / f"{safe_disease_id}_comparison.npz"
 
@@ -359,22 +335,63 @@ class Retriever:
         WITH g, coalesce(g.an_ids, []) AS an_ids
 
         MATCH (p:Entity {id: g.ph_id, label:"phenotype"})
-                -[pa:LOCATED_IN]->(a:Entity {label:"anatomy"})
-                -[:AFFECTS]->(d:Entity {label:"disease"})
+              -[pa:LOCATED_IN]->(a:Entity {label:"anatomy"})
+              -[:AFFECTS]->(d:Entity {label:"disease"})
         WHERE (size(an_ids) = 0 OR a.id IN an_ids)
-            AND pa.disease_id = d.id
+          AND pa.disease_id = d.id
 
         RETURN DISTINCT d.id AS did
         LIMIT $candidate_limit
         """
 
         with self._driver.session(database=self._config.database) as s:
-            return [r["did"] for r in s.run(cypher, {"groups": ph_an_groups, "candidate_limit": int(candidate_limit)})]
+            return [
+                r["did"]
+                for r in s.run(
+                    cypher,
+                    {"groups": ph_an_groups, "candidate_limit": int(candidate_limit)},
+                )
+            ]
+
+    def _fetch_global_partial_pairs(
+        self,
+        ph_an_groups: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Build ONE shared partial graph from the requested groups.
+
+        For each group:
+          - phenotype must match g.ph_id
+          - if g.an_ids is empty: include all anatomies linked to that phenotype
+          - else: include only requested anatomies that actually exist in DB
+
+        This partial graph is disease-independent and will be reused for every
+        candidate complete graph.
+        """
+        if not ph_an_groups:
+            return []
+
+        cypher = """
+        WITH $groups AS groups
+        UNWIND groups AS g
+        WITH g, coalesce(g.an_ids, []) AS an_ids
+
+        MATCH (p:Entity {id: g.ph_id, label:"phenotype"})-[r:LOCATED_IN]->(a:Entity {label:"anatomy"})
+        WHERE size(an_ids) = 0 OR a.id IN an_ids
+
+        RETURN collect(DISTINCT {
+            ph: p { .id, .label, .layer, .data },
+            an: a { .id, .label, .layer, .data }
+        }) AS partial_pairs
+        """
+
+        with self._driver.session(database=self._config.database) as s:
+            rec = s.run(cypher, {"groups": ph_an_groups}).single()
+            return rec["partial_pairs"] if rec and rec["partial_pairs"] else []
 
     def _fetch_graph_rows_for_diseases(
         self,
         disease_ids: List[str],
-        ph_an_groups: List[Dict[str, Any]],
         include_parent_of: bool,
         max_full_pairs: int,
     ) -> List[Dict[str, Any]]:
@@ -383,76 +400,59 @@ class Retriever:
 
         cypher = """
         WITH
-        $disease_ids AS disease_ids,
-        $groups AS groups,
-        $include_parent_of AS include_po
+          $disease_ids AS disease_ids,
+          $include_parent_of AS include_po
 
         UNWIND disease_ids AS did
         MATCH (d:Entity {id: did, label:"disease"})
 
         OPTIONAL MATCH (d)-[:AFFECTS]-(a:Entity {label:"anatomy"})
-        WITH d, include_po, groups, collect(DISTINCT a { .id, .label, .layer, .data }) AS full_anatomies
+        WITH d, include_po, collect(DISTINCT a { .id, .label, .layer, .data }) AS full_anatomies
 
         CALL {
-        WITH d, groups
-        UNWIND groups AS g
-        MATCH (p:Entity {id: g.ph_id, label:"phenotype"})
-                -[:LOCATED_IN {disease_id: d.id}]->(a:Entity {label:"anatomy"})
-
-        RETURN collect(DISTINCT {
-            ph: p { .id, .label, .layer, .data },
-            an: a { .id, .label, .layer, .data }
-        }) AS partial_pairs
+            WITH d
+            MATCH (p:Entity {label:"phenotype"})
+                  -[:LOCATED_IN {disease_id: d.id}]->(a:Entity {label:"anatomy"})
+            WITH DISTINCT p, a
+            LIMIT $max_full_pairs
+            RETURN collect(DISTINCT {
+                ph: p { .id, .label, .layer, .data },
+                an: a { .id, .label, .layer, .data }
+            }) AS full_pairs,
+            collect(DISTINCT p { .id, .label, .layer, .data }) AS full_phenotypes
         }
 
         CALL {
-        WITH d
-        MATCH (p:Entity {label:"phenotype"})
-                -[:LOCATED_IN {disease_id: d.id}]->(a:Entity {label:"anatomy"})
-
-        WITH DISTINCT p, a
-        LIMIT $max_full_pairs
-
-        RETURN collect(DISTINCT {
-            ph: p { .id, .label, .layer, .data },
-            an: a { .id, .label, .layer, .data }
-        }) AS full_pairs,
-        collect(DISTINCT p { .id, .label, .layer, .data }) AS full_phenotypes
+            WITH include_po, d
+            WITH d WHERE include_po = true
+            OPTIONAL MATCH (p:Entity {label:"disease"})-[rp:PARENT_OF]->(d)
+            RETURN collect(DISTINCT {
+                parent: p { .id, .label, .layer, .data },
+                rel: { weight: 1.0 }
+            }) AS full_parents
         }
 
         CALL {
-        WITH include_po, d
-        WITH d WHERE include_po = true
-        OPTIONAL MATCH (p:Entity {label:"disease"})-[rp:PARENT_OF]->(d)
-        RETURN collect(DISTINCT {
-            parent: p { .id, .label, .layer, .data },
-            rel: { weight: 1.0 }
-        }) AS full_parents
-        }
-
-        CALL {
-        WITH include_po, d
-        WITH d WHERE include_po = true
-        OPTIONAL MATCH (d)-[rc:PARENT_OF]->(c:Entity {label:"disease"})
-        RETURN collect(DISTINCT {
-            child: c { .id, .label, .layer, .data },
-            rel: { weight: 1.0 }
-        }) AS full_children
+            WITH include_po, d
+            WITH d WHERE include_po = true
+            OPTIONAL MATCH (d)-[rc:PARENT_OF]->(c:Entity {label:"disease"})
+            RETURN collect(DISTINCT {
+                child: c { .id, .label, .layer, .data },
+                rel: { weight: 1.0 }
+            }) AS full_children
         }
 
         RETURN
-        d { .id, .label, .layer, .data } AS disease,
-        partial_pairs,
-        full_pairs,
-        full_phenotypes,
-        full_anatomies,
-        coalesce(full_parents, []) AS full_parents,
-        coalesce(full_children, []) AS full_children
+            d { .id, .label, .layer, .data } AS disease,
+            full_pairs,
+            full_phenotypes,
+            full_anatomies,
+            coalesce(full_parents, []) AS full_parents,
+            coalesce(full_children, []) AS full_children
         """
 
         params = {
             "disease_ids": disease_ids,
-            "groups": ph_an_groups,
             "include_parent_of": include_parent_of,
             "max_full_pairs": int(max_full_pairs),
         }
@@ -531,7 +531,7 @@ class Retriever:
 
         if missing:
             new_vecs: List[Optional[np.ndarray]] = [None] * len(missing)
-            self.token_counter.add_embed(missing)   # ← count only cache misses
+            self.token_counter.add_embed(missing)
             try:
                 if hasattr(embedder, "encode"):
                     arr = np.asarray(embedder.encode(missing, normalize=True), dtype=np.float32)
@@ -646,29 +646,30 @@ class Retriever:
 
         return out_matched, out_unmatched
 
-
-
     def fetch_partial_and_complete_graphs_by_groups(
-    self,
-    ph_an_groups: List[Dict[str, Any]],
-    phenotype_mode: MatchMode = "ANY",
-    anatomy_mode: MatchMode = "ANY",
-    include_parent_of: bool = False,
-    limit: int = 50,
-    max_full_pairs: int = 2000,
-) -> List[Dict[str, Any]]:
+        self,
+        ph_an_groups: List[Dict[str, Any]],
+        phenotype_mode: MatchMode = "ANY",
+        anatomy_mode: MatchMode = "ANY",
+        include_parent_of: bool = False,
+        limit: int = 50,
+        max_full_pairs: int = 2000,
+    ) -> List[Dict[str, Any]]:
         ph_an_groups = ph_an_groups or []
         if not ph_an_groups:
             return []
 
         ph_out_deg, anatomy_out_deg = self._fetch_node_degree_maps()
+
         disease_ids = self._fetch_candidate_disease_ids(ph_an_groups, limit)
         if not disease_ids:
             return []
 
+        # Build ONE shared partial graph for all candidate diseases
+        shared_partial_pairs = self._fetch_global_partial_pairs(ph_an_groups)
+
         rows = self._fetch_graph_rows_for_diseases(
             disease_ids=disease_ids,
-            ph_an_groups=ph_an_groups,
             include_parent_of=include_parent_of,
             max_full_pairs=max_full_pairs,
         )
@@ -686,6 +687,8 @@ class Retriever:
                 "rel_ad": {"weight": _safe_weight(anatomy_out_deg.get(an.get("id", ""), 0))},
             }
 
+        annotated_shared_partial = [_annotate_pair(p) for p in shared_partial_pairs]
+
         out: List[Dict[str, Any]] = []
         for r in rows:
             full_anatomies = [
@@ -698,7 +701,9 @@ class Retriever:
 
             out.append({
                 "disease": r.get("disease", {}),
-                "partial_graph": {"pairs": [_annotate_pair(p) for p in (r.get("partial_pairs") or [])]},
+                "partial_graph": {
+                    "pairs": annotated_shared_partial
+                },
                 "complete_graph": {
                     "pairs": [_annotate_pair(p) for p in (r.get("full_pairs") or [])],
                     "phenotypes": r.get("full_phenotypes") or [],
@@ -710,7 +715,6 @@ class Retriever:
 
         return out
 
-    
     def build_clusters(
         self,
         *,
@@ -819,8 +823,6 @@ class Retriever:
             "clusters": clusters,
         }
 
-# import numpy as np
-# 
     def rank_clusters_and_get_top_symptoms(
         self,
         ids_filtered,
@@ -834,24 +836,21 @@ class Retriever:
     ):
         ph_id_to_name = ph_id_to_name or {}
 
-        # query embedding
         q = np.asarray(embed_fn(query_text), dtype=np.float64).reshape(-1)
         q /= (np.linalg.norm(q) + 1e-12)
 
         if not clusters:
             return []
 
-        # ---- score cluster means in a vectorized way ----
         labels = list(clusters.keys())
-        mean_matrix = np.vstack([clusters[lab]["mean_embedding"] for lab in labels])  # [C, D]
-        cluster_scores = mean_matrix @ q                                              # [C]
+        mean_matrix = np.vstack([clusters[lab]["mean_embedding"] for lab in labels])
+        cluster_scores = mean_matrix @ q
 
         k_clusters = min(top_k_clusters, len(labels))
         top_cluster_pos = np.argpartition(-cluster_scores, k_clusters - 1)[:k_clusters]
         top_cluster_pos = top_cluster_pos[np.argsort(-cluster_scores[top_cluster_pos])]
         top_labels = [labels[pos] for pos in top_cluster_pos]
 
-        # ---- collect all member indices from top clusters ----
         selected_indices = np.concatenate(
             [np.asarray(clusters[lab]["member_indices"], dtype=np.int64) for lab in top_labels]
         )
@@ -859,7 +858,6 @@ class Retriever:
         if selected_indices.size == 0:
             return []
 
-        # ---- score all selected items at once ----
         item_scores = X_normalized[selected_indices] @ q
 
         k_items = min(top_k_clusters * top_k_items_per_cluster, selected_indices.size)
@@ -874,10 +872,6 @@ class Retriever:
         ]
 
     def _get_phenotype_catalog(self) -> dict:
-        """
-        Load phenotype_catalog.json exactly once and cache it on the instance.
-        All subsequent calls return the cached dict instantly.
-        """
         if getattr(self, "_phenotype_catalog", None) is None:
             path = "dataset/phenotype_catalog.json"
             with open(path, "r", encoding="utf-8") as fh:
@@ -892,7 +886,7 @@ class Retriever:
         previous_diseases: list,
         sim_threshold_ph: float = 0.8,
         sim_threshold_an: float = 0.8,
-        top_k_ph: int = 1,
+        top_k_ph: int = 2,
         top_k_an_per_ph: int = 1,
         phenotype_mode="ANY",
         include_parent_of: bool = False,
@@ -904,7 +898,6 @@ class Retriever:
 
         try:
             t0 = time.perf_counter()
-            # ── 1. catalog ─────────────────────────────────────────────
             catalog = self._get_phenotype_catalog()
             self.token_counter.reset()
 
@@ -920,21 +913,21 @@ class Retriever:
                 )
             except Exception as e:
                 print(e)
-            # ── 3. LLM parsing ─────────────────────────────────────────
+                ranked = []
+
             messages = _build_ner_messages(query, ranked)
             response = self.chat.create_response(message=messages)
-            print("AMIRRRR")
-            print(response)
             self.token_counter.add_llm(getattr(response, "usage", None))
             raw = (response.choices[0].message.content or "").strip()
+            if "```json" in raw:
+                raw = raw.split("```json")[-1].rsplit("```", 1)[0].strip()
             ph_to_an_inputs = safe_parse_llm_json(raw) or {}
             print(ph_to_an_inputs)
             phenotype_texts = [k for k in ph_to_an_inputs if k]
-            
+
             if not phenotype_texts:
                 return _EMPTY
 
-            # ── 4. phenotype candidates (cached) ───────────────────────
             ttl_sec = 3600
             now_t = time.time()
             cache = getattr(self, "_ph_candidates_cache", None)
@@ -947,7 +940,6 @@ class Retriever:
                 )
                 self._ph_candidates_cache = {"t": now_t, "v": ph_candidates}
 
-            # ── 5. phenotype matching ──────────────────────────────────
             matched_ph_top, _ = self._match_inputs_to_candidates(
                 phenotype_texts,
                 self.embedder,
@@ -959,7 +951,6 @@ class Retriever:
             if not matched_ph_top:
                 return _EMPTY
 
-            # ── 6. anatomy candidates ──────────────────────────────────
             ph_ids = [
                 hit["id"]
                 for hits in matched_ph_top.values()
@@ -969,7 +960,6 @@ class Retriever:
 
             an_cand_map = self._fetch_anatomy_candidates_for_phenotype_ids(ph_ids)
 
-            # ── 7. anatomy matching (parallel) ─────────────────────────
             tasks = [
                 (ph_text, ph_hit)
                 for ph_text, ph_hits in matched_ph_top.items()
@@ -1007,7 +997,6 @@ class Retriever:
                 for ph_id, an_ids in pool.map(lambda x: _match_one(*x), tasks):
                     an_results.setdefault(ph_id, an_ids)
 
-            # ── 8. assemble groups ─────────────────────────────────────
             groups = []
             seen = set()
 
@@ -1021,10 +1010,8 @@ class Retriever:
                 return _EMPTY
 
             current_ph = [g["ph_id"] for g in groups]
-            current_an = list({a for g in groups for a in g["an_ids"]})
-
-            # ── 9. fetch subgraphs ─────────────────────────────────────
             all_groups = previous_groups + groups
+
             subgraphs = self.fetch_partial_and_complete_graphs_by_groups(
                 ph_an_groups=all_groups,
                 phenotype_mode=phenotype_mode,
@@ -1033,33 +1020,40 @@ class Retriever:
                 limit=limit,
             )
 
-            # ── 10. filter ─────────────────────────────────────────────
             _set_ph = set(current_ph)
-            ph_required = max(1, math.ceil(0.2 * len(current_ph)))
+            if not previous_groups:
+                ph_required = 1
+            else:
+                ph_required = min(2, len(_set_ph))
             nx_pairs = []
             for sg in subgraphs:
-                pairs = sg["partial_graph"].get("pairs", [])
-                sg_ph = {p["ph"]["id"] for p in pairs if p.get("ph") and p["ph"].get("id")}
-                if len(sg_ph & _set_ph) >= ph_required:
-                    nx_pairs.append({
+                complete_pairs = sg["complete_graph"].get("pairs", [])
+                cg_ph = {
+                    p["ph"]["id"]
+                    for p in complete_pairs
+                    if p.get("ph") and p["ph"].get("id")
+                }
+                if len(cg_ph & _set_ph) >= ph_required:
+                    item = {
                         "disease": sg.get("disease") or {},
                         "partial": _to_nx_partial_graph(sg),
                         "complete": _to_nx_complete_graph(sg),
-                    })
+                    }
+                    nx_pairs.append(item)
+                    # save_partial_and_complete(item)
 
             disease_in_nx_pairs = [item["disease"]["id"] for item in nx_pairs]
             _strip_embeddings(subgraphs)
 
-            # ── 11. scoring (parallel) ─────────────────────────────────
             def _score_one(item):
                 PN, _, PA_ = adjacency_dense(item["partial"])
                 CN, _, CA_ = adjacency_dense(item["complete"])
 
                 score, gamma, p, q = pflgw_directed_distance(
-                    CA_, PA_,
-                    complete_node_ids=CN,
-                    partial_node_ids=PN,
-                )
+                    A_ref=CA_,
+                    A_tgt=PA_,
+                    complete_node_ids=CN,   
+                    partial_node_ids=PN,)
 
                 return {
                     "score": score,
@@ -1078,21 +1072,10 @@ class Retriever:
             with ThreadPoolExecutor(max_workers=_SCORE_WORKERS) as pool:
                 unranked_result = list(pool.map(_score_one, nx_pairs))
 
-            # if save_ca_pa_path:
-            #     self._save_ca_pa_matrices(unranked_result, save_ca_pa_path)
-            #     for item in unranked_result:
-            #         item.pop("CA", None)
-            #         item.pop("PA", None)
-            #         item.pop("CN", None)
-            #         item.pop("PN", None)
-            #         item.pop("gamma", None)
-            #         item.pop("p", None)
-            #         item.pop("q", None)
-
-            # ── 12. sort ───────────────────────────────────────────────
-            sorted_list = sorted(unranked_result, key=lambda x: x["score"], reverse=True)
+            sorted_list = sorted(unranked_result, key=lambda x: x["score"], reverse=False)
             sorted_diseases = [item["id"] for item in sorted_list]
             time_taken = time.perf_counter() - t0
+
             return (
                 sorted_list,
                 ranked,
@@ -1105,9 +1088,5 @@ class Retriever:
             )
 
         except Exception:
+            logger.exception("retrieve_partial_graphs failed")
             return [], [], {}, [], [], [], None, None
-
-
-
-
-

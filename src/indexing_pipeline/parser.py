@@ -6,8 +6,9 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List
+from tqdm import tqdm
 
-from src.pipeline.entity_extractor import SchemaDrivenExtractor, SchemaSpec, load_schema
+from src.indexing_pipeline.entity_extractor import SchemaDrivenExtractor, SchemaSpec, load_schema
 
 
 logging.basicConfig(
@@ -95,22 +96,28 @@ def process_directory(
     if not txt_files:
         raise FileNotFoundError(f"No .txt files found in: {input_dir}")
 
+    logger.info(f"Found {len(txt_files)} files to process")
     shaped_records: List[dict] = []
     failed_files: List[Dict[str, str]] = []
 
-    for txt_file in txt_files:
-        logger.info("Processing %s", txt_file.name)
+    for txt_file in tqdm(txt_files, desc="Processing files", unit="file"):
+        logger.info(f"📄 Processing: {txt_file.name}")
         try:
             extracted = extractor.extract_file(schema=schema, txt_path=txt_file)
             shaped_record = build_record_from_extraction(extracted, schema)
             shaped_records.append(shaped_record)
+            logger.info(f"✓ Successfully processed: {txt_file.name}")
         except Exception as exc:
-            logger.exception("Failed processing %s", txt_file.name)
+            logger.error(f"❌ Failed processing {txt_file.name}: {str(exc)}", exc_info=True)
             failed_files.append({
                 "file": txt_file.name,
                 "error": str(exc),
             })
 
+    logger.info(f"\n✅ Processed {len(shaped_records)} files successfully")
+    if failed_files:
+        logger.warning(f"⚠️  {len(failed_files)} files failed")
+    
     if not shaped_records:
         raise RuntimeError("All files failed. No output was generated.")
 
@@ -125,8 +132,17 @@ def process_directory(
 def write_output(output_dir: Path, payload: Dict[str, Any], filename: str = "combined_graph_payload.json") -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
+    
+    logger.info(f"📝 Writing output to: {output_path}")
     output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    logger.info("Wrote %s", output_path)
+    
+    file_size_kb = output_path.stat().st_size / 1024
+    logger.info(f"✓ Output written successfully")
+    logger.info(f"   - File size: {file_size_kb:.2f} KB")
+    logger.info(f"   - Records: {len(payload.get('records', []))}")
+    if "failed_files" in payload:
+        logger.info(f"   - Failed files: {len(payload['failed_files'])}")
+    
     return output_path
 
 
