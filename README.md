@@ -40,8 +40,8 @@ Key components:
 │   ├── graph_comparison/           # PFLGW distance implementation (key contribution)
 │   │   └── fpgw_dis.py             # Partial Fused Gromov-Wasserstein distance
 │   ├── indexing_pipeline/          # Knowledge graph construction pipeline
-│   ├── medical_agent/              # LangGraph agent, tools, and evaluation harness
-│   ├── preprocessing/              # Disease/gene/anatomy data preprocessing
+│   ├── evaluation/                 # Evaluation harness and runner
+│   ├── medical_agent/              # LangGraph agent and tools
 │   ├── retrieval/                  # Retriever combining embeddings + graph distance
 │   └── utils/
 ├── requirements.txt
@@ -109,15 +109,7 @@ Edit `src/config/config.json`:
 
 ## Building the Knowledge Graph
 
-### Step 1 — Preprocess source data
-
-```bash
-python -m src.preprocessing.build_disease
-python -m src.preprocessing.build_disease_rel
-python -m src.preprocessing.build_gene_anatomy
-```
-
-### Step 2 — Extract entities and ingest into Neo4j
+Place your expert knowledge documents in the `input/` folder, then run the indexing pipeline to extract entities and build the Neo4j graph:
 
 ```bash
 python -m src.indexing_pipeline.pipeline \
@@ -139,7 +131,7 @@ Before running evaluation, the Neo4j knowledge graph must be built and the retri
 
 ### Configure the evaluation script
 
-Open `src/medical_agent/run_evaluation.py` and set the absolute path to the evaluation dataset:
+Open `src/evaluation/run_evaluation.py` and set the absolute path to the evaluation dataset:
 
 ```python
 excel_path="dataset/complex_scenario_questions.xlsx",
@@ -150,7 +142,7 @@ excel_path="dataset/complex_scenario_questions.xlsx",
 ### Run evaluation
 
 ```bash
-python -m src.medical_agent.run_evaluation
+python -m src.evaluation.run_evaluation
 ```
 
 This evaluates the agent on the complex scenario benchmark over three rounds and prints cumulative top-3 accuracy per round.

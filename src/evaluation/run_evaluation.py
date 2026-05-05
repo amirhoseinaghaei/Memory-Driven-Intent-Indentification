@@ -4,7 +4,7 @@ from src.config.config import settings
 from src.gen_ai_gateway.chat_completion import ChatCompletion
 from src.retrieval.retriever4 import Retriever
 from src.medical_agent.agent import build_graph_agent, build_mapping_state, SYMPTOM_MAPPING_PATH
-from src.medical_agent.evaluation import evaluate_3round_excel
+from src.evaluation.evaluation import evaluate_3round_excel
 
 
 def main() -> None:
